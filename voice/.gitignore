@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.cache/
+
+# Tooling / locks
+uv.lock
+
+# Local smoke / scratch scripts (kept locally, not part of the library)
+smoke.py
+loop_smoke.py
+
+# Models / audio scratch
+*.wav
+*.mp3
+models/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

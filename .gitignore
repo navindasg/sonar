@@ -1,0 +1,70 @@
+# ─── Secrets (this repo is PUBLIC — never commit real secrets) ───
+.env
+.env.*
+!.env.example
+**/secrets.yaml
+**/secrets.yml
+**/secrets.json
+**/*.secret.*
+client_secret*.json
+credentials.json
+token.json
+*.token
+*.pem
+*.p12
+id_rsa*
+config/*.local.yaml
+config/*.local.yml
+config/*.local.json
+
+# ─── Live state / data (durable memory lives in the Obsidian vault, not here) ───
+*.sqlite
+*.sqlite3
+*.db
+*-wal
+*-shm
+*.faiss
+state/*.db
+state/data/
+.obsidian-rag/
+indexes/
+
+# ─── Python ───
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ─── Node / dashboard (later) ───
+node_modules/
+dist/
+.next/
+
+# ─── Swift / Xcode (overlay) ───
+.build/
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+
+# ─── Planning / scratch docs (kept local, not committed) ───
+.planning/
+planning/
+docs/planning/
+PLANNING.md
+*.plan.md
+.claude/
+scratch/
+notes/local/
+
+# ─── macOS / misc ───
+.DS_Store
+*.log
+loop_out.wav
+smoke_out.wav

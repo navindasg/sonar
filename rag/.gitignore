@@ -1,0 +1,11 @@
+.planning/
+.coverage
+.DS_Store
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+dist/
+*.egg-info/
+claude.MD

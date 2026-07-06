@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>osvoice</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; font: 15px/1.5 system-ui, sans-serif;
+      background: #111418; color: #e6e9ee; padding: 24px; max-width: 720px;
+    }
+    h1 { font-size: 18px; margin: 0 0 16px; }
+    .row { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+    button {
+      font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid #3a4150;
+      background: #1c2027; color: #e6e9ee; cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: #262c36; }
+    button:disabled { opacity: .45; cursor: default; }
+    button.active { background: #2563eb; border-color: #2563eb; }
+    #status { font-size: 13px; color: #98a2b3; }
+    .panel { background: #181c22; border: 1px solid #262c36; border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+    .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #6b7280; margin-bottom: 6px; }
+    #transcript .partial { color: #98a2b3; font-style: italic; }
+    #transcript .final { color: #e6e9ee; }
+    #assistant { white-space: pre-wrap; min-height: 1.4em; }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #4b5563; }
+    .dot.on { background: #22c55e; }
+    .dot.speaking { background: #f59e0b; }
+  </style>
+</head>
+<body>
+  <h1>osvoice <span style="color:#6b7280;font-weight:400">— local voice client</span></h1>
+
+  <div class="row">
+    <button id="startBtn">Start session</button>
+    <button id="talkBtn" disabled>Hold to talk</button>
+    <button id="muteBtn" disabled>Mute mic</button>
+    <button id="interruptBtn" disabled>Interrupt</button>
+    <span class="dot" id="micDot"></span>
+    <span id="status">idle</span>
+  </div>
+
+  <div class="panel">
+    <div class="label">You</div>
+    <div id="transcript">&nbsp;</div>
+  </div>
+
+  <div class="panel">
+    <div class="label">Assistant <span class="dot" id="spkDot"></span></div>
+    <div id="assistant">&nbsp;</div>
+  </div>
+
+  <script>
+    'use strict';
+
+    // ----- Pipeline boundary sample rates (must match the server contracts) ----
+    const CAPTURE_RATE = 16000;
+    const PLAYBACK_RATE = 24000;
+
+    const $ = (id) => document.getElementById(id);
+    const els = {
+      start: $('startBtn'), talk: $('talkBtn'), mute: $('muteBtn'),
+      interrupt: $('interruptBtn'), status: $('status'), micDot: $('micDot'),
+      spkDot: $('spkDot'), transcript: $('transcript'), assistant: $('assistant'),
+    };
+
+    // Mutable session handle; rebuilt on each Start, torn down on Stop.
+    let session = null;
+
+    const setStatus = (text) => { els.status.textContent = text; };
+
+    // --------------------------------------------------------------------------
+    // WebSocket: JSON events update the DOM; binary frames are 24 kHz PCM16 audio
+    // handed to the playback worklet.
+    // --------------------------------------------------------------------------
+    function connect(playbackNode) {
+      const ws = new WebSocket(`ws://${location.host}/ws`);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => setStatus('connected');
+      ws.onclose = () => setStatus('disconnected');
+      ws.onerror = () => setStatus('socket error');
+
+      ws.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          pushPcmToPlayback(playbackNode, event.data);
+        } else {
+          handleEvent(playbackNode, JSON.parse(event.data));
+        }
+      };
+      return ws;
+    }
+
+    // Convert an incoming PCM16 frame -> Float32 (/32768) and feed the worklet.
+    function pushPcmToPlayback(playbackNode, buffer) {
+      const pcm = new Int16Array(buffer);
+      const samples = new Float32Array(pcm.length);
+      for (let i = 0; i < pcm.length; i++) samples[i] = pcm[i] / 32768;
+      playbackNode.port.postMessage(samples, [samples.buffer]);
+    }
+
+    function handleEvent(playbackNode, msg) {
+      switch (msg.type) {
+        case 'partial':
+          els.transcript.innerHTML = `<span class="partial">${escapeHtml(msg.text)}</span>`;
+          break;
+        case 'final':
+          els.transcript.innerHTML = `<span class="final">${escapeHtml(msg.text)}</span>`;
+          break;
+        case 'assistant_text':
+          els.assistant.textContent = msg.text;
+          break;
+        case 'speaking_start':
+          els.spkDot.classList.add('speaking');
+          setStatus('assistant speaking');
+          break;
+        case 'speaking_end':
+          els.spkDot.classList.remove('speaking');
+          setStatus('listening');
+          break;
+        case 'interrupted':
+          // Drop everything still queued for playback so barge-in is instant.
+          playbackNode.port.postMessage('flush');
+          els.spkDot.classList.remove('speaking');
+          setStatus('interrupted');
+          break;
+      }
+    }
+
+    const escapeHtml = (s) =>
+      s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+
+    // --------------------------------------------------------------------------
+    // Start a session: two separate AudioContexts (no JS resampling), load both
+    // worklets, wire the mic -> capture worklet -> WS, and playback worklet -> out.
+    // --------------------------------------------------------------------------
+    async function start() {
+      els.start.disabled = true;
+      setStatus('requesting mic…');
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+      });
+
+      // 24 kHz playback graph.
+      const playCtx = new AudioContext({ sampleRate: PLAYBACK_RATE });
+      await playCtx.audioWorklet.addModule('playback-worklet.js');
+      const playbackNode = new AudioWorkletNode(playCtx, 'playback-processor', {
+        numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1],
+      });
+      playbackNode.connect(playCtx.destination);
+
+      // 16 kHz capture graph.
+      const capCtx = new AudioContext({ sampleRate: CAPTURE_RATE });
+      await capCtx.audioWorklet.addModule('capture-worklet.js');
+      const micSource = capCtx.createMediaStreamSource(stream);
+      const captureNode = new AudioWorkletNode(capCtx, 'capture-processor');
+      micSource.connect(captureNode);
+      // Connect to destination so the graph is pulled; gain 0 avoids echoing mic.
+      const sink = capCtx.createGain();
+      sink.gain.value = 0;
+      captureNode.connect(sink).connect(capCtx.destination);
+
+      const ws = connect(playbackNode);
+
+      // Each Int16 buffer from the worklet becomes one WS binary frame when armed.
+      captureNode.port.onmessage = (event) => {
+        if (session && session.sending && ws.readyState === WebSocket.OPEN) {
+          ws.send(event.data); // ArrayBuffer of Int16 PCM @16 kHz
+        }
+      };
+
+      session = { ws, stream, capCtx, playCtx, playbackNode, sending: false };
+
+      els.talk.disabled = false;
+      els.mute.disabled = false;
+      els.interrupt.disabled = false;
+      els.start.textContent = 'Stop session';
+      els.start.disabled = false;
+      setStatus('listening');
+    }
+
+    async function stop() {
+      if (!session) return;
+      const s = session;
+      session = null;
+      try { s.ws.close(); } catch (_) {}
+      s.stream.getTracks().forEach((t) => t.stop());
+      try { await s.capCtx.close(); } catch (_) {}
+      try { await s.playCtx.close(); } catch (_) {}
+
+      els.micDot.classList.remove('on');
+      els.spkDot.classList.remove('speaking');
+      els.talk.disabled = els.mute.disabled = els.interrupt.disabled = true;
+      els.start.textContent = 'Start session';
+      setStatus('idle');
+    }
+
+    // Control messages the server understands: end_turn endpoints the utterance,
+    // interrupt triggers barge-in.
+    const sendControl = (type) => {
+      if (session && session.ws.readyState === WebSocket.OPEN) {
+        session.ws.send(JSON.stringify({ type }));
+      }
+    };
+
+    // --------------------------------------------------------------------------
+    // Push-to-talk: arm capture on press, disarm + end_turn on release so the
+    // server runs exactly one turn over the spoken audio.
+    // --------------------------------------------------------------------------
+    function beginTalk() {
+      if (!session || session.muted) return;
+      session.sending = true;
+      els.micDot.classList.add('on');
+      els.assistant.textContent = ' ';
+      setStatus('recording…');
+    }
+
+    function endTalk() {
+      if (!session || !session.sending) return;
+      session.sending = false;
+      els.micDot.classList.remove('on');
+      sendControl('end_turn');
+      setStatus('thinking…');
+    }
+
+    // --------------------------------------------------------------------------
+    // Wiring.
+    // --------------------------------------------------------------------------
+    els.start.addEventListener('click', () => {
+      (session ? stop() : start()).catch((err) => {
+        console.error('session error', err);
+        setStatus(`error: ${err.message}`);
+        els.start.disabled = false;
+      });
+    });
+
+    // Hold-to-talk via pointer + spacebar.
+    els.talk.addEventListener('pointerdown', beginTalk);
+    els.talk.addEventListener('pointerup', endTalk);
+    els.talk.addEventListener('pointerleave', endTalk);
+    document.addEventListener('keydown', (e) => {
+      if (e.code === 'Space' && !e.repeat && session) { e.preventDefault(); beginTalk(); }
+    });
+    document.addEventListener('keyup', (e) => {
+      if (e.code === 'Space' && session) { e.preventDefault(); endTalk(); }
+    });
+
+    // Mic mute: hard-stop sending and gate the mic tracks.
+    els.mute.addEventListener('click', () => {
+      if (!session) return;
+      session.muted = !session.muted;
+      session.stream.getAudioTracks().forEach((t) => (t.enabled = !session.muted));
+      if (session.muted) { endTalk(); }
+      els.mute.classList.toggle('active', session.muted);
+      els.mute.textContent = session.muted ? 'Unmute mic' : 'Mute mic';
+    });
+
+    els.interrupt.addEventListener('click', () => {
+      sendControl('interrupt');
+      if (session) session.playbackNode.port.postMessage('flush');
+    });
+
+    window.addEventListener('beforeunload', () => { stop(); });
+  </script>
+</body>
+</html>
