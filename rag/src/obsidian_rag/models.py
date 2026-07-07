@@ -53,7 +53,11 @@ class IndexingConfig(BaseModel):
 
 class RetrievalConfig(BaseModel):
     top_k: int = Field(default=5, gt=0)
-    similarity_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    # 0.5, not 0.7: eval on the real vault (rag/evals) showed nomic-embed-text
+    # lands ~40% of correct answers in cosine 0.55-0.69, which a 0.7 cutoff
+    # wrongly drops. Agentic RAG prefers recall (the LLM filters results) over an
+    # aggressive floor. See rag/evals/config.yaml for the measurement.
+    similarity_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     max_context_tokens: int = Field(default=4000, gt=0)
 
 

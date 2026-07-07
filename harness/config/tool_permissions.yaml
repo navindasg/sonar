@@ -1,0 +1,13 @@
+# Per-tool permission overrides (ported from brook37 config/tool_permissions.yaml).
+#
+# Sonar collapses brook37's four tiers to two (see CONTRACTS.md §1):
+#   local  = auto-run inside a voice turn (read-only / safe side effects)
+#   gated  = human approval required (browser / mutation) — not reachable in a
+#            synchronous voice turn until the approval seam lands.
+#
+# A tool absent from this file falls back to its class-declared `permission`.
+
+rag.search: local
+rag.note_context: local
+todo_add: local
+state_read: local

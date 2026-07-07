@@ -1,0 +1,4 @@
+# Personal — NEVER commit (this is a public repo). Copy the .example.* templates.
+# These carry real vault content (questions, facts, absolute paths).
+config.yaml
+golden.json

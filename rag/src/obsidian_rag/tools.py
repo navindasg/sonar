@@ -475,6 +475,59 @@ def reindex(vault_name: str, ctx: Context | None = None) -> dict:
 # 7. note_context
 # ---------------------------------------------------------------------------
 
+# Cap on the neighbor preview text attached to each forward link. Long enough
+# for an agent to judge whether a thread is worth following, short enough to keep
+# a fan-out of links cheap in the model's context window.
+NEIGHBOR_SNIPPET_CHARS = 200
+
+
+def _neighbor_snippets(metadata: dict[str, dict]) -> dict[str, dict]:
+    """Map each file to a short opening preview drawn from its earliest chunks.
+
+    For every file, walk its chunks in chunk_id order (its reading order) and
+    concatenate their text until NEIGHBOR_SNIPPET_CHARS is reached. Concatenating
+    rather than taking only the lowest chunk matters because heading-based
+    chunking often makes a note's H1 intro a tiny chunk ("# Title\n\nPart of
+    [[Hub]]."); pulling the next chunk in gives the agent real body content to
+    judge the thread by. heading_path comes from the first (lowest-id) chunk.
+
+    This is an in-memory scan (no disk reads), mirroring how backlink snippets
+    are produced, so note_context stays cheap even for hub notes that link to
+    dozens of neighbors.
+
+    Args:
+        metadata: Dict of chunk_id -> chunk metadata dicts (from vault_indexes).
+
+    Returns:
+        Dict mapping relative file path -> {"heading_path", "snippet"}.
+    """
+    chunks_by_file: dict[str, list[dict]] = {}
+    for chunk in metadata.values():
+        file_path = chunk.get("file", "")
+        if not file_path:
+            continue
+        chunks_by_file.setdefault(file_path, []).append(chunk)
+
+    previews: dict[str, dict] = {}
+    for file_path, chunks in chunks_by_file.items():
+        ordered = sorted(chunks, key=lambda c: c.get("chunk_id", 0))
+        parts: list[str] = []
+        length = 0
+        for chunk in ordered:
+            text = chunk.get("text", "")
+            if not text:
+                continue
+            parts.append(text)
+            length += len(text)
+            if length >= NEIGHBOR_SNIPPET_CHARS:
+                break
+        snippet = "\n\n".join(parts)[:NEIGHBOR_SNIPPET_CHARS]
+        previews[file_path] = {
+            "heading_path": ordered[0].get("heading_path", ""),
+            "snippet": snippet,
+        }
+    return previews
+
 
 def note_context(
     path: str,
@@ -483,6 +536,12 @@ def note_context(
 ) -> dict:
     """Return a note plus its single-hop backlinks and forward wikilinks.
 
+    Each existing forward link and every backlink carries a short neighbor
+    SNIPPET (plus heading_path), so an agent driving its own retrieval can pick
+    which thread to follow next WITHOUT a read_note round-trip per neighbor.
+    Forward-link snippets preview the target note's opening; backlink snippets
+    show the linking context around the reference.
+
     Args:
         path: Relative path to the markdown file within the vault.
         vault_name: Target vault (uses first vault if None).
@@ -490,7 +549,10 @@ def note_context(
 
     Returns:
         dict with "note", "forward_links", "backlinks" on success,
-        or "error", "path", "suggestion" on failure.
+        or "error", "path", "suggestion" on failure. Each forward_links entry has
+        "path" and "exists"; existing targets also carry "heading_path" and
+        "snippet". Each backlinks entry has "source_path", "heading_path",
+        "snippet".
     """
     lifespan = ctx.lifespan_context
     vault_indexes: dict = lifespan["vault_indexes"]
@@ -518,6 +580,14 @@ def note_context(
     if err is not None:
         return err
 
+    # Snippets and backlinks both read the shared chunk metadata, so take the
+    # lock once. neighbor_snippets previews every note's opening (D-14) so each
+    # resolved forward link can carry an inline preview; backlinks scan the same
+    # metadata for references to this note (D-11).
+    with index_lock:
+        neighbor_snippets = _neighbor_snippets(vault_data["metadata"])
+        backlinks = find_backlinks(resolved.stem, vault_data["metadata"])
+
     # Parse forward wikilinks (D-12); one note index serves all targets
     forward_targets = parse_wikilinks(content)
     note_index = build_note_index(vault_root) if forward_targets else {}
@@ -530,15 +600,15 @@ def note_context(
         matches = resolve_wikilink(target, vault_root, note_index=note_index)
         if matches:
             for match in matches:
-                forward_links.append(
-                    {"path": str(match.relative_to(vault_root)), "exists": True}
-                )
+                rel = str(match.relative_to(vault_root))
+                link = {"path": rel, "exists": True}
+                preview = neighbor_snippets.get(rel)
+                if preview is not None:
+                    link["heading_path"] = preview["heading_path"]
+                    link["snippet"] = preview["snippet"]
+                forward_links.append(link)
         else:
             forward_links.append({"path": target, "exists": False})
-
-    # Find backlinks (D-11) — scan metadata in memory, under the lock
-    with index_lock:
-        backlinks = find_backlinks(resolved.stem, vault_data["metadata"])
 
     return {
         "note": {"path": path, "content": content},

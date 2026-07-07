@@ -39,7 +39,7 @@ def test_default_values(tmp_path):
     assert cfg.embedding.batch_size == 64
     assert cfg.indexing.chunk_strategy == "heading"
     assert cfg.retrieval.top_k == 5
-    assert cfg.retrieval.similarity_threshold == 0.7
+    assert cfg.retrieval.similarity_threshold == 0.5
     assert cfg.rerank.enabled is False
     assert cfg.tools.enabled == [
         "search",

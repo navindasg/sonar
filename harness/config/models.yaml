@@ -1,0 +1,22 @@
+# Sonar model router config (ported/adapted from brook37 config/models.yaml).
+#
+# Precedence chain (see sonar_harness/model_router.py):
+#   1. per-turn escalation classifier  -> STUBBED for a future pass
+#   2. global default
+#
+# Sonar adaptation vs brook37: local Ollama aliases instead of Anthropic ids.
+# Tool-selection turns run on the fast model; the escalate hook is wired but
+# the classifier that would flip a turn to `reason` is not built yet.
+
+default: fast          # gemma4:e4b-mlx — voice / chit-chat / routing / tool-select
+escalation: reason     # gemma4:26b-mlx — deep reasoning / grounded synthesis
+
+# When a turn actually invoked tools, redo the FINAL grounded answer on the
+# escalation model. The fast model selects tools reliably but synthesizes weakly;
+# this pays a 26b call (cold-load ~15s first time, ~1s warm) ONLY on tool turns,
+# never on chit-chat. Set false to keep everything on the fast model.
+escalate_synthesis_after_tools: true
+
+aliases:
+  fast: "gemma4:e4b-mlx"
+  reason: "gemma4:26b-mlx"

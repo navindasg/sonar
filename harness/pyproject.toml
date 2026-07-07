@@ -1,0 +1,30 @@
+[project]
+name = "sonar-harness"
+version = "0.1.0"
+description = "Sonar harness: OpenAI-compatible /v1 tool-using brain over local gemma (Ollama) + Obsidian RAG."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+    # The RAG boundary. Consumed in-process behind the ToolBase interface
+    # (swapping to an MCP stdio child is a config change, not a code change).
+    # Pulls faiss-cpu / numpy / ollama / python-frontmatter / fastmcp transitively.
+    "obsidian-rag",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.uv.sources]
+obsidian-rag = { path = "../rag", editable = true }
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sonar_harness*"]

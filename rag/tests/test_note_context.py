@@ -316,6 +316,82 @@ def test_tool_not_registered_when_disabled(app_config):
     assert note_context_fn is None, "note_context should not be registered when disabled"
 
 
+def test_forward_links_carry_neighbor_snippets(mock_ctx):
+    """Existing forward links carry an inline snippet + heading_path preview.
+
+    The agent can judge which thread to follow without a read_note per neighbor.
+    """
+    note_context_fn = make_note_context_fn(mock_ctx.lifespan_context["config"])
+
+    result = note_context_fn(path="wikilinks-callouts.md", ctx=mock_ctx)
+
+    wsn = next(fl for fl in result["forward_links"] if "wsn-pipeline" in fl["path"])
+    assert wsn["exists"] is True
+    assert "snippet" in wsn and wsn["snippet"], "existing forward link must carry a snippet"
+    assert "heading_path" in wsn
+    # Snippet is drawn from wsn-pipeline.md's opening chunk in metadata.
+    assert "wikilinks-callouts" in wsn["snippet"]
+    assert wsn["heading_path"] == "# WSN Pipeline"
+
+
+def test_forward_link_snippet_is_truncated(mock_ctx, vault_path):
+    """Neighbor snippets are capped at NEIGHBOR_SNIPPET_CHARS."""
+    from obsidian_rag.tools import NEIGHBOR_SNIPPET_CHARS
+
+    # Give wsn-pipeline.md's opening chunk a long body.
+    long_text = "See [[wikilinks-callouts]]. " + ("padding words " * 60)
+    mock_ctx.lifespan_context["vault_indexes"]["test"]["metadata"]["0"]["text"] = long_text
+
+    note_context_fn = make_note_context_fn(mock_ctx.lifespan_context["config"])
+    result = note_context_fn(path="wikilinks-callouts.md", ctx=mock_ctx)
+
+    wsn = next(fl for fl in result["forward_links"] if "wsn-pipeline" in fl["path"])
+    assert len(wsn["snippet"]) <= NEIGHBOR_SNIPPET_CHARS
+
+
+def test_nonexistent_forward_link_has_no_snippet(mock_ctx):
+    """A forward link to a note with no chunks (missing) has no snippet key."""
+    note_context_fn = make_note_context_fn(mock_ctx.lifespan_context["config"])
+
+    result = note_context_fn(path="wikilinks-callouts.md", ctx=mock_ctx)
+
+    missing = next(fl for fl in result["forward_links"] if "2024-01-15" in fl["path"])
+    assert missing["exists"] is False
+    assert "snippet" not in missing
+
+
+def test_snippet_begins_at_opening_chunk_and_reads_forward(mock_ctx):
+    """Snippet starts at the opening chunk and concatenates forward in chunk order.
+
+    heading_path is taken from the lowest-id (opening) chunk; the snippet text
+    begins with that chunk and pulls in later chunks only to fill out the preview.
+    """
+    metadata = mock_ctx.lifespan_context["vault_indexes"]["test"]["metadata"]
+    # Opening chunk 0 is short, so a later chunk (id 5) fills out the preview.
+    metadata["2"] = {
+        "chunk_id": 5,
+        "file": "wsn-pipeline.md",
+        "heading_path": "# WSN Pipeline > ## Later Section",
+        "text": "Continuation from a later section of the pipeline note.",
+        "tags": [],
+        "folder": "",
+        "vault": "test",
+        "modified_ts": 1700000200.0,
+        "char_count": 55,
+    }
+
+    note_context_fn = make_note_context_fn(mock_ctx.lifespan_context["config"])
+    result = note_context_fn(path="wikilinks-callouts.md", ctx=mock_ctx)
+
+    wsn = next(fl for fl in result["forward_links"] if "wsn-pipeline" in fl["path"])
+    # heading_path anchors to the opening chunk, not the later one.
+    assert wsn["heading_path"] == "# WSN Pipeline"
+    # Snippet begins with the opening chunk's text.
+    assert wsn["snippet"].startswith("See [[wikilinks-callouts]]")
+    # And, since the opening chunk is short, reads forward into the later chunk.
+    assert "later section" in wsn["snippet"]
+
+
 def test_note_context_deduplicates_forward_links(mock_ctx, vault_path):
     """A target linked twice in one note appears once in forward_links."""
     note = vault_path / "dupes.md"

@@ -1,0 +1,29 @@
+{
+  "description": "EXAMPLE golden set for the retrieval eval, using the checked-in fixtures in rag/tests/fixtures/sample_vault (fictional data — safe to commit). Copy to golden.json and replace with questions about YOUR vault. golden.json + config.yaml are gitignored because they carry personal content. 'expected' holds vault-relative source_path values (as returned by rag.search); a question counts as hit@5 if ANY expected path is in the top-5.",
+  "questions": [
+    {
+      "id": "ex01-wsn-architecture",
+      "question": "What architecture does the WSN pipeline project use?",
+      "expected": ["projects/wsn-pipeline.md"],
+      "fact": "Three-tier architecture."
+    },
+    {
+      "id": "ex02-wsn-deployment",
+      "question": "How is the WSN pipeline deployed?",
+      "expected": ["projects/wsn-pipeline.md"],
+      "fact": "Deployed on Kubernetes with auto-scaling."
+    },
+    {
+      "id": "ex03-wsn-email-ingestion",
+      "question": "In the WSN pipeline, what happens to incoming emails?",
+      "expected": ["projects/wsn-pipeline.md"],
+      "fact": "Emails are parsed and stored in the queue."
+    },
+    {
+      "id": "ex04-obsidian-callouts",
+      "question": "Which note documents Obsidian wikilinks and callout blocks?",
+      "expected": ["wikilinks-callouts.md"],
+      "fact": "wikilinks-callouts.md covers wikilinks, callouts, and embeds."
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+# EXAMPLE eval config using the checked-in sample fixtures (safe to commit).
+# Copy to config.yaml and point `path` at YOUR real vault to run evals locally.
+# config.yaml and golden.json are GITIGNORED — they carry personal vault content
+# and this is a public repo.
+#
+# PATHS WITH SPACES: if your vault path contains a space (e.g.
+# "~/Documents/Obsidian Vault"), DOUBLE-QUOTE it here and anywhere it is passed
+# on a command line, or word-splitting truncates it at the space.
+
+vaults:
+  # Path is relative to the rag/ directory (run evals from there), or absolute.
+  - name: "sample-eval"
+    path: "tests/fixtures/sample_vault"
+    excluded_dirs: [".obsidian", ".trash", "templates"]
+
+embedding:
+  model: nomic-embed-text          # pulled locally (768-dim); on-device via Ollama
+  ollama_url: http://127.0.0.1:11434
+  batch_size: 64
+
+indexing:
+  chunk_strategy: heading
+  chunk_max_tokens: 512
+  chunk_overlap: 50
+  include_frontmatter: metadata_only
+  watch_enabled: false             # one-shot index for eval; no file watcher
+
+retrieval:
+  top_k: 5
+  similarity_threshold: 0.5        # Sonar default (see rag/src/obsidian_rag/models.py)
+  max_context_tokens: 4000
+
+rerank:
+  enabled: false
