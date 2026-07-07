@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd LaunchAgent TEMPLATE for the Sonar brief-builder worker.
+
+  This is a TEMPLATE, not a ready-to-load agent. Placeholders (__UPPER__) are
+  substituted by install.sh into ~/Library/LaunchAgents. Do NOT load this file
+  directly. launchd is used (not cron) because cron silently skips jobs missed
+  while the Mac is asleep (see docs/DECISIONS.md).
+
+  StartCalendarInterval fires daily at 07:00 local. RunAtLoad is false so
+  installing does not immediately run a brief — the user runs the first one.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sonar.brief-builder</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__UV_BIN__</string>
+        <string>run</string>
+        <string>--directory</string>
+        <string>__WORKDIR__</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>brief_builder</string>
+        <string>--window</string>
+        <string>morning</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>WorkingDirectory</key>
+    <string>__WORKDIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>OLLAMA_HOST</key>
+        <string>http://127.0.0.1:11434</string>
+        <key>MODEL_FAST</key>
+        <string>gemma4:e4b-mlx</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__LOGDIR__/brief-builder.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOGDIR__/brief-builder.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Sonar F5(dictation) -> F13 hidutil remap, applied at login.
+
+      hidutil user key mappings are volatile: they reset on reboot and on
+      keyboard reconnect. This LaunchAgent re-applies the mapping every time
+      the user logs in (RunAtLoad). No root/sudo is needed for user key
+      mapping, so this is a per-user LaunchAgent under ~/Library/LaunchAgents.
+
+      Source usage 0x0000000C000000CF = Consumer page 0x0C, usage 0xCF
+        (the MacBook dictation key, physically F5 on Apple-silicon laptops).
+      Destination 0x700000068 = Keyboard page 0x07, usage 0x68 = F13.
+    -->
+    <key>Label</key>
+    <string>com.sonar.hotkey-remap</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/hidutil</string>
+        <string>property</string>
+        <string>--set</string>
+        <string>{"UserKeyMapping":[{"HIDKeyboardModifierMappingSrc":0x0000000C000000CF,"HIDKeyboardModifierMappingDst":0x700000068}]}</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- One-shot: apply the mapping and exit; do not treat exit as a crash. -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/com.sonar.hotkey-remap.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/com.sonar.hotkey-remap.err.log</string>
+</dict>
+</plist>

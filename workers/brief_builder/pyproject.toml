@@ -1,0 +1,28 @@
+[project]
+name = "brief-builder"
+version = "0.1.0"
+description = "Sonar deterministic worker: assemble a daily brief into SQLite live-state + an Obsidian vault note."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # Minimal on purpose: stdlib sqlite3 for state, httpx for the single Ollama leaf call.
+    "httpx>=0.27",
+]
+
+[project.scripts]
+brief-builder = "brief_builder.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/brief_builder"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

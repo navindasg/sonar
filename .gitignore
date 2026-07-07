@@ -59,9 +59,13 @@ planning/
 docs/planning/
 PLANNING.md
 *.plan.md
+/state.md
 .claude/
 scratch/
 notes/local/
+
+# ─── Generated spike assets (regenerate with the script next to them) ───
+spike/glow/vignette.png
 
 # ─── macOS / misc ───
 .DS_Store
