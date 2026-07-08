@@ -65,7 +65,7 @@ def _build_state(app: FastAPI) -> None:
         embedding_model=embed_model,
     )
     registry = ToolRegistry.load(
-        tools=default_tools(rag_backend=backend),
+        tools=default_tools(rag_backend=backend, vault_path=vault_path),
         config_path=CONFIG_DIR / "tool_permissions.yaml",
     )
     app.state.registry = registry
@@ -75,6 +75,12 @@ def _build_state(app: FastAPI) -> None:
     app.state.state = State.open()
     app.state.events = EventSink()
     app.state.charter = load_charter(CONFIG_DIR / "charter.md")
+
+    # Preload the hot model so the first turn is warm (~1 s) instead of a
+    # multi-second cold reload. keep_alive pins it resident thereafter.
+    default_model = app.state.models.resolve(app.state.models.default)
+    app.state.ollama.warm(default_model)
+
     log.info(
         "harness ready: %d tools, %d indexed chunks",
         len(registry.names()),

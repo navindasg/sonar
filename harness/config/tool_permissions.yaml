@@ -10,4 +10,6 @@
 rag.search: local
 rag.note_context: local
 todo_add: local
+todo_done: local
+todo_list: local
 state_read: local

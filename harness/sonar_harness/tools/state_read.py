@@ -17,17 +17,23 @@ from sonar_harness.tools.base import ToolBase, ToolContext
 class StateReadTool(ToolBase):
     name = "state_read"
     description = (
-        "Read the harness's live state: the most recent daily 'brief' the "
-        "assistant assembled, or recent background 'worker_runs'. Use for "
-        "questions about today's brief or whether a background job ran."
+        "Read the harness's live state. kind='todos' returns the tasks the user "
+        "asked YOU to remember (the ones you saved with todo_add) — use this "
+        "whenever the user asks 'what did I ask you to remember', 'what's on your "
+        "list', or about your reminders. kind='brief' = the latest daily brief; "
+        "kind='worker_runs' = recent background job outcomes. NOTE: this reads "
+        "YOUR list, not the user's own notes — for those use todo_list."
     )
     input_schema = {
         "type": "object",
         "properties": {
             "kind": {
                 "type": "string",
-                "enum": ["brief", "worker_runs"],
-                "description": "'brief' = latest assembled brief; 'worker_runs' = recent job outcomes.",
+                "enum": ["brief", "worker_runs", "todos"],
+                "description": (
+                    "'brief' = latest assembled brief; 'worker_runs' = recent "
+                    "job outcomes; 'todos' = open tasks you captured via todo_add."
+                ),
             }
         },
         "required": ["kind"],
@@ -36,8 +42,8 @@ class StateReadTool(ToolBase):
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> str:
         kind = args.get("kind")
-        if kind not in ("brief", "worker_runs"):
-            return "error: state_read 'kind' must be 'brief' or 'worker_runs'."
+        if kind not in ("brief", "worker_runs", "todos"):
+            return "error: state_read 'kind' must be 'brief', 'worker_runs', or 'todos'."
         try:
             if kind == "brief":
                 row = ctx.state.conn.execute(
@@ -53,10 +59,18 @@ class StateReadTool(ToolBase):
                         "created_at": row["created_at"],
                     }
                 )
-            else:
+            elif kind == "worker_runs":
                 rows = ctx.state.conn.execute(
                     "SELECT worker, status, started_at, finished_at, detail "
                     "FROM worker_runs ORDER BY started_at DESC LIMIT 5"
+                ).fetchall()
+                payload = [dict(r) for r in rows]
+            else:  # todos — the assistant's own open list, soonest-due first
+                ctx.state.expire_todos()  # drop stale ones before showing
+                rows = ctx.state.conn.execute(
+                    "SELECT id, text, due, created_at FROM todos "
+                    "WHERE status = 'open' "
+                    "ORDER BY (due IS NULL), due, created_at LIMIT 50"
                 ).fetchall()
                 payload = [dict(r) for r in rows]
         except Exception as exc:  # defensive — DB shape drift shouldn't kill a turn

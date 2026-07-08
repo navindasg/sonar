@@ -16,7 +16,7 @@ block/caching transport is a formatting change, not a re-architecture.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 DEFAULT_CHARTER_PATH = Path("config/charter.md")
@@ -27,8 +27,16 @@ def load_charter(path: Path | str = DEFAULT_CHARTER_PATH) -> str:
 
 
 def _clock_block(now: datetime | None = None) -> str:
-    now = now or datetime.now(timezone.utc)
-    return f"<clock>\nCurrent time: {now.strftime('%Y-%m-%d %H:%M %Z')}\n</clock>"
+    # LOCAL time (not UTC): the model reasons about the user's "today"/"overdue"
+    # for date-scoped tools like todo_list, and near midnight the UTC date can be
+    # a day off. Stated explicitly so the model actually anchors dates to it.
+    now = now or datetime.now().astimezone()
+    return (
+        "<clock>\n"
+        f"Today is {now:%A, %Y-%m-%d} (local time {now:%H:%M %Z}). "
+        "Anchor any date reasoning — 'today', 'overdue', 'this week' — to this.\n"
+        "</clock>"
+    )
 
 
 def build_system_prompt(

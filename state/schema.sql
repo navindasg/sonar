@@ -32,3 +32,18 @@ CREATE TABLE IF NOT EXISTS worker_runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_worker_runs_worker ON worker_runs (worker, started_at);
+
+-- The assistant's OWN captured to-dos — its disposable working memory, distinct
+-- from the user's durable Obsidian checkboxes (those live in the vault and are
+-- read via the todo_list tool, never copied here). The harness writes these via
+-- todo_add and reads them via state_read(kind='todos').
+CREATE TABLE IF NOT EXISTS todos (
+    id          INTEGER PRIMARY KEY,
+    created_at  TEXT NOT NULL,                  -- ISO-8601 UTC of capture
+    text        TEXT NOT NULL,                  -- the task, short imperative
+    status      TEXT NOT NULL DEFAULT 'open',   -- 'open' | 'done'
+    due         TEXT,                           -- optional ISO date (YYYY-MM-DD)
+    done_at     TEXT                            -- ISO-8601 UTC when done, else NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_todos_status ON todos (status, created_at);
