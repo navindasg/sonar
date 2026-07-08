@@ -12,10 +12,14 @@ default: fast          # gemma4:e4b-mlx — voice / chit-chat / routing / tool-s
 escalation: reason     # gemma4:26b-mlx — deep reasoning / grounded synthesis
 
 # When a turn actually invoked tools, redo the FINAL grounded answer on the
-# escalation model. The fast model selects tools reliably but synthesizes weakly;
-# this pays a 26b call (cold-load ~15s first time, ~1s warm) ONLY on tool turns,
-# never on chit-chat. Set false to keep everything on the fast model.
-escalate_synthesis_after_tools: true
+# escalation model. The fast model selects tools reliably but synthesizes weakly.
+#
+# OFF for now (plumbing/overlay testing): on a 36 GB machine e4b (11 GB) + 26b
+# (~18 GB) don't comfortably co-reside, so escalation evicts the hot model and
+# swaps the 26b in — a single tool turn was measured at 275 s that way. Warm
+# e4b-only turns are ~1 s. Re-enable once the 26b path is tuned (dedicated
+# keep_alive / fits-in-memory check / a per-turn classifier).
+escalate_synthesis_after_tools: false
 
 aliases:
   fast: "gemma4:e4b-mlx"
