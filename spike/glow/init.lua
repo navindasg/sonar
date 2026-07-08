@@ -80,7 +80,7 @@ local function layout()
 end
 
 -- ============================================================ bar (command bar)
-local BAR_W, BAR_H = 720, 112
+local BAR_W, BAR_H = 720, 132
 
 local BAR_HTML = [[<!doctype html><html><head><meta charset="utf-8"><style>
   :root { color-scheme: dark; }
@@ -88,7 +88,7 @@ local BAR_HTML = [[<!doctype html><html><head><meta charset="utf-8"><style>
   html,body { background:transparent; font-family:-apple-system,"SF Pro Text",system-ui,sans-serif; }
   #wrap { padding:10px; }
   #bar {
-    background:rgba(11,12,15,0.84);
+    background:rgba(11,12,15,0.86);
     border:1px solid rgba(255,255,255,0.07);
     border-radius:16px;
     box-shadow:0 20px 60px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.04);
@@ -96,24 +96,59 @@ local BAR_HTML = [[<!doctype html><html><head><meta charset="utf-8"><style>
     padding:14px 18px;
   }
   #heard { display:flex; align-items:center; gap:10px; min-height:20px; margin-bottom:11px; }
-  #dot { width:8px; height:8px; border-radius:50%; background:#9aa0ac; box-shadow:0 0 9px rgba(154,160,172,.7); flex:0 0 auto; animation:pulse 1.9s ease-in-out infinite; }
-  @keyframes pulse { 0%,100%{opacity:.3} 50%{opacity:.95} }
-  #heardText { color:#aab0bb; font-size:13.5px; letter-spacing:.2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #dot { width:8px; height:8px; border-radius:50%; background:#9aa0ac; box-shadow:0 0 9px rgba(154,160,172,.7); flex:0 0 auto; }
+  #dot.busy { background:#5b9dff; box-shadow:0 0 12px rgba(91,157,255,.9); animation:pulse 1.1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:.35} 50%{opacity:1} }
+  #heardText { color:#aab0bb; font-size:13px; letter-spacing:.2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #heardText.empty { color:#5b616c; font-style:italic; }
   #cmd { width:100%; background:transparent; border:0; outline:0; color:#eef1f6; font-size:18px; letter-spacing:.2px; caret-color:#9aa0ac; }
   #cmd::placeholder { color:#5b616c; }
+  #answer { color:#e7ebf2; font-size:15px; line-height:1.55; margin-top:12px; white-space:pre-wrap; word-wrap:break-word; display:none; }
+  #answer.show { display:block; }
+  #stepsWrap { margin-top:12px; border-top:1px solid rgba(255,255,255,0.06); padding-top:8px; display:none; }
+  #stepsWrap.show { display:block; }
+  #stepsHdr { color:#7d8590; font-size:12px; letter-spacing:.3px; cursor:pointer; user-select:none; display:flex; align-items:center; gap:6px; }
+  #stepsHdr:hover { color:#aab0bb; }
+  #caret { display:inline-block; transition:transform .12s ease; }
+  #stepsWrap.open #caret { transform:rotate(90deg); }
+  #steps { list-style:none; margin-top:8px; display:none; }
+  #stepsWrap.open #steps { display:block; }
+  #steps li { color:#9aa0ac; font-size:12.5px; line-height:1.7; display:flex; gap:8px; align-items:baseline; }
+  #steps li.err { color:#e0787f; }
+  #steps .ico { flex:0 0 auto; }
 </style></head><body><div id="wrap"><div id="bar">
-  <div id="heard"><span id="dot"></span><span id="heardText" class="empty">Listening…</span></div>
-  <input id="cmd" type="text" autocomplete="off" spellcheck="false" placeholder="Speak, or type here…"/>
+  <div id="heard"><span id="dot"></span><span id="heardText" class="empty">Ask, or type…</span></div>
+  <input id="cmd" type="text" autocomplete="off" spellcheck="false" placeholder="Type a question, then Enter…"/>
+  <div id="answer"></div>
+  <div id="stepsWrap"><div id="stepsHdr"><span id="caret">▸</span><span id="stepsLabel">steps</span></div><ul id="steps"></ul></div>
 </div></div>
 <script>
-  const heard = document.getElementById('heardText'), cmd = document.getElementById('cmd');
-  function setHeard(t){ if(t&&t.length){ heard.textContent=t; heard.classList.remove('empty'); } else { heard.textContent='Listening…'; heard.classList.add('empty'); } }
+  const heard=document.getElementById('heardText'), cmd=document.getElementById('cmd'),
+        dot=document.getElementById('dot'), answer=document.getElementById('answer'),
+        stepsWrap=document.getElementById('stepsWrap'), steps=document.getElementById('steps'),
+        stepsLabel=document.getElementById('stepsLabel');
+  function post(m){ try{window.webkit.messageHandlers.sonar.postMessage(m);}catch(_){} }
+  function fit(){ post('__h__:'+Math.ceil(document.body.scrollHeight)); }
+  function setHeard(t){ if(t&&t.length){ heard.textContent=t; heard.classList.remove('empty'); } else { heard.textContent='Ask, or type…'; heard.classList.add('empty'); } }
+  function setBusy(b){ dot.classList.toggle('busy', !!b); }
+  function clearTurn(){ answer.textContent=''; answer.classList.remove('show'); steps.innerHTML=''; stepsWrap.classList.remove('show','open'); stepsLabel.textContent='steps'; fit(); }
+  function appendAnswer(t){ answer.classList.add('show'); answer.textContent+=t; fit(); }
+  const ICON={'rag.search':'🔍','search':'🔍','rag.note_context':'🧵','note_context':'🧵','model_switch':'🧠','final':'✓'};
+  function addStep(kind,label,status){
+    stepsWrap.classList.add('show');
+    const li=document.createElement('li'); if(status==='error') li.className='err';
+    const ic=document.createElement('span'); ic.className='ico'; ic.textContent=ICON[kind]||'·';
+    const tx=document.createElement('span'); tx.textContent=label;
+    li.appendChild(ic); li.appendChild(tx); steps.appendChild(li);
+    stepsLabel.textContent='steps ('+steps.children.length+')'; fit();
+  }
+  document.getElementById('stepsHdr').addEventListener('click',()=>{ stepsWrap.classList.toggle('open'); fit(); });
   cmd.addEventListener('keydown', e => {
-    if(e.key==='Enter'){ const v=cmd.value.trim(); if(v){ try{window.webkit.messageHandlers.sonar.postMessage(v);}catch(_){}; cmd.value=''; setHeard('you typed: '+v);} }
-    if(e.key==='Escape'){ try{window.webkit.messageHandlers.sonar.postMessage('__esc__');}catch(_){} }
+    if(e.key==='Enter'){ const v=cmd.value.trim(); if(v){ post(v); cmd.value=''; setHeard(v); clearTurn(); setBusy(true);} }
+    if(e.key==='Escape'){ post('__esc__'); }
   });
-  window.focusCmd = () => cmd.focus();
+  window.focusCmd=()=>cmd.focus();
+  window.sonar={setHeard,setBusy,clearTurn,appendAnswer,addStep};
 </script></body></html>]]
 
 local function barRect(screen)
@@ -129,9 +164,12 @@ local function buildBar()
     M.barUCC = hs.webview.usercontent.new("sonar")
     M.barUCC:setCallback(function(msg)
       local body = msg and msg.body
+      if type(body) ~= "string" then return end
       if body == "__esc__" then M.hideBar(); return end
+      local h = body:match("^__h__:(%d+)$")
+      if h then M.resizeBar(tonumber(h)); return end
       M.lastTyped = body
-      print("[sonar-bar] typed: " .. tostring(body))
+      M.sendText(body)   -- run this typed question through the harness
     end)
     local w = hs.webview.new(barRect(hs.screen.primaryScreen()), { developerExtrasEnabled = false }, M.barUCC)
     w:windowStyle({ "borderless" })
@@ -180,6 +218,52 @@ function M.onTranscript(text, partial)
   M.setTranscript(joined)
 end
 
+-- ---- typed-turn helpers (Stream C: box <-> harness via overlay/bridge.py) ----
+local function jsEsc(s)
+  return (tostring(s or "")):gsub("\\", "\\\\"):gsub("'", "\\'"):gsub("\n", "\\n"):gsub("\r", "")
+end
+
+function M.evalBar(js)
+  if M.bar then pcall(function() M.bar:evaluateJavaScript(js) end) end
+end
+
+-- Grow/shrink the command bar to fit its content (JS reports document height).
+function M.resizeBar(h)
+  if not M.bar then return end
+  local target = math.max(120, math.min(560, (tonumber(h) or BAR_H) + 4))
+  local f = M.bar:frame()
+  M.bar:frame(hs.geometry.rect(f.x, f.y, BAR_W, target))
+end
+
+-- Send a typed question to the bridge, which runs it through the harness.
+function M.sendText(t)
+  if M.ws and M.wsOpen then
+    pcall(function() M.ws:send(hs.json.encode({ text = t })) end)
+  else
+    M.evalBar("window.sonar && sonar.appendAnswer('[bridge not connected — start overlay/bridge.py]')")
+    M.evalBar("window.sonar && sonar.setBusy(false)")
+  end
+end
+
+-- Render one harness step-event into the expandable "steps taken" panel.
+function M.renderStep(e)
+  local kind = e.tool or e.step or "tool"
+  local label
+  if e.tool then
+    label = e.tool .. (e.detail and (": " .. e.detail) or "")
+  elseif e.step == "model_switch" then
+    label = e.detail or "model switch"
+  elseif e.step == "final" then
+    label = "done"
+  elseif e.step == "turn_start" then
+    return   -- redundant with the typed question already shown in the box
+  else
+    label = (e.step or "step") .. (e.detail and (": " .. e.detail) or "")
+  end
+  M.evalBar(("window.sonar && sonar.addStep('%s','%s','%s')"):format(
+    jsEsc(kind), jsEsc(label), jsEsc(e.status or "ok")))
+end
+
 -- ============================================================ websocket
 local connect
 local function scheduleReconnect()
@@ -204,6 +288,12 @@ connect = function()
           M.rxTranscript = data.transcript
           M.onTranscript(data.transcript, data.partial == true)
         end
+        if data.answer ~= nil and data.answer ~= "" then
+          M.evalBar(("window.sonar && sonar.appendAnswer('%s')"):format(jsEsc(data.answer)))
+        end
+        if type(data.step) == "table" then M.renderStep(data.step) end
+        if data.turn == "start" then M.evalBar("window.sonar && sonar.setBusy(true)")
+        elseif data.turn == "end" then M.evalBar("window.sonar && sonar.setBusy(false)") end
       else
         print("[sonar-rx] decode failed: " .. tostring(message))
       end
@@ -223,7 +313,8 @@ local function showOverlay()
   if M.visible then return end
   M.committed = ""   -- fresh transcript each time the box opens
   M.visible = true; M.state = "listening"; render(); showAll(); M.showBar()
-  sendCmd("start")   -- tell the STT bridge to start listening
+  hs.timer.doAfter(0.16, function() M.evalBar("window.sonar && sonar.clearTurn()") end)
+  sendCmd("start")   -- ack to the bridge (glow state)
 end
 local function hideOverlay()
   if not M.visible then return end
@@ -269,6 +360,15 @@ sonarGlow = {
   hide = hideOverlay,
   setState = function(s, lvl) M.state = s or M.state; M.level = tonumber(lvl) or M.level; render() end,
   say = function(t) M.visible = true; render(); showAll(); M.showBar(); M.setTranscript(t) end,
+  -- Drive a full typed turn headlessly (opens the overlay, runs it through the
+  -- harness):  hs -c 'sonarGlow.ask("what does my note say about X?")'
+  ask = function(t)
+    showOverlay()
+    hs.timer.doAfter(0.35, function()
+      M.evalBar("window.sonar && sonar.clearTurn(); window.sonar && sonar.setBusy(true)")
+      M.sendText(t)
+    end)
+  end,
   status = function()
     return hs.inspect({
       visible = M.visible, state = M.state, level = M.level, screens = #M.canvases,
