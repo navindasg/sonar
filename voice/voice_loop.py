@@ -209,16 +209,19 @@ class VoiceLoop:
                     await self._send(ws, {"state": "listening", "level": 0.2})
                     print("[voice] listening", flush=True)
                 elif cmd == "stop":
+                    # Second F5 / overlay close: stop EVERYTHING now — mic off,
+                    # turn cancelled, and any audio still queued is flushed so the
+                    # reply doesn't keep playing after you've dismissed it.
                     self.listening = False
                     self.stop_mic()
-                    await self._cancel_response()
+                    await self._silence()
                     await self._send(ws, {"state": "idle", "level": 0.0})
                     print("[voice] stopped", flush=True)
         finally:
             consumer.cancel()
             self.listening = False
             self.stop_mic()
-            await self._cancel_response()
+            await self._silence()  # dropped socket: don't keep talking to a gone overlay
 
     async def _consume(self, ws) -> None:
         """Single mic loop: capture+STT while listening, barge-in while speaking."""
@@ -307,14 +310,10 @@ class VoiceLoop:
     async def _barge_in(self, ws) -> None:
         """User talked over the reply: kill reply+audio, reset, resume listening."""
         print("[voice] barge-in", flush=True)
-        await self._cancel_response()
-        self.player.flush()
-        self.player.set_gain(1.0)
-        self.gate.reset()
+        await self._silence()
         self.endpointer.reset()
         if self.silero is not None:
             self.silero.reset_states()
-        self.speaking = False
         await self._send(ws, {"answer": "", "partial": False})
         await self._send(ws, {"state": "listening", "level": 0.2})
 
@@ -332,6 +331,21 @@ class VoiceLoop:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+
+    async def _silence(self) -> None:
+        """Hard cutoff: kill the in-flight turn AND drop audio already queued.
+
+        Order matters — cancel the response FIRST (so no more TTS frames can be
+        written once the buffer is dropped), THEN flush the speaker. Cancelling
+        alone only stops *feeding* new audio; whatever Kokoro already queued keeps
+        playing. Also un-ducks and resets the echo gate so the next turn is clean.
+        This is what makes a second F5 (or a barge-in) stop everything at once.
+        """
+        await self._cancel_response()
+        self.player.flush()          # drop buffered PCM -> speaker goes quiet now
+        self.player.set_gain(1.0)
+        self.gate.reset()
+        self.speaking = False
 
     async def _respond(self, ws, text: str) -> None:
         """Drive one turn: spoken ack -> streamed harness answer -> box + speaker."""
