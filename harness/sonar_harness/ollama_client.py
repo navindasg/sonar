@@ -80,6 +80,7 @@ class OllamaChat:
         temperature: float = 0.0,
         num_predict: int = 512,
         num_ctx: int = 16384,
+        keep_alive: str | int | None = None,
     ) -> dict[str, Any]:
         """Return the assistant ``message`` dict for one non-streaming turn.
 
@@ -93,12 +94,19 @@ class OllamaChat:
         headroom while bounding the worst case to seconds. ``num_ctx`` shrinks
         the KV cache from the wasteful 131072 default — plenty for the charter +
         tool schemas + retrieved passages (retrieval caps context at ~4k).
+
+        ``keep_alive`` overrides the client default for THIS call, so the router
+        can pin the always-on fast model (-1) while giving the on-demand reasoner
+        a short idle TTL (e.g. "8m") — the 26b then frees its RAM when idle.
         """
+        effective_keep_alive = (
+            self._keep_alive if keep_alive is None else _coerce_keep_alive(keep_alive)
+        )
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "stream": False,
-            "keep_alive": self._keep_alive,
+            "keep_alive": effective_keep_alive,
             "options": {
                 "temperature": temperature,
                 "num_predict": num_predict,

@@ -1,0 +1,43 @@
+# SearXNG settings TEMPLATE for Sonar. `up.sh` copies this to instance/settings.yml
+# (gitignored) on first run, replacing `ultrasecretkey` with `openssl rand -hex 32`
+# so no real secret is ever committed. Edit the template for durable changes, then
+# regenerate: extract the secret from instance/settings.yml, re-`sed` the template
+# over it, and `docker compose restart searxng`.
+#
+# `use_default_settings: true` inherits SearXNG's full defaults and merges only the
+# keys below on top, so this stays small and survives version bumps.
+#
+# NOTE on engine noise: two things show up in `docker compose logs` and are BOTH
+# harmless — do not chase them:
+#   * `ahmia`/`torch` "can't register engine" — Tor/onion engines shipped in the
+#     defaults that can't load without a Tor proxy. Two one-time lines at startup;
+#     they simply don't load. (Can't be removed via `use_default_settings.engines.
+#     remove` — that KeyError-crashes the worker on this build — and `disabled: true`
+#     doesn't help either, since they fail at *registration*, before the flag applies.)
+#   * `X-Forwarded-For nor X-Real-IP header is set` — botdetection griping about no
+#     reverse proxy; benign with `limiter: false` (requests are never rejected).
+use_default_settings: true
+
+server:
+  # Replaced with a random key on first `up.sh`. Signs session cookies; on a
+  # localhost single-user instance the exposure is minimal, but we rotate it anyway.
+  secret_key: "ultrasecretkey"
+  # Single private user hitting a JSON API — no bot-detection/rate-limit needed.
+  # Disabling it also removes the Redis/Valkey dependency (one container, not three).
+  limiter: false
+  image_proxy: false
+
+search:
+  # THE critical line for Sonar: SearXNG ships `formats: [html]` only, which makes
+  # /search?format=json return 403. web.search calls the JSON API, so enable it.
+  formats:
+    - html
+    - json
+
+# Brave aggressively rate-limits scraping, so it threw a TooManyRequests traceback
+# on EVERY search. Unlike ahmia/torch it loads fine, so `disabled: true` works here
+# and silences that per-search spam. Plenty of engines remain (duckduckgo, google,
+# startpage, wikipedia, ...).
+engines:
+  - name: brave
+    disabled: true

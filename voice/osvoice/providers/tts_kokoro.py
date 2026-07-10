@@ -109,13 +109,21 @@ class KokoroTTS:
         return frames
 
     def _generate(self, clause: str) -> Iterator[Any]:
-        """Return Kokoro's streaming generator (runs in a worker thread)."""
+        """Return Kokoro's per-sentence generator (runs in a worker thread).
+
+        Non-streaming on purpose: mlx-audio's streaming path (stream=True +
+        streaming_interval) slices each sentence into ~interval-sized chunks and
+        concatenates them, which on this build throws ``[broadcast_shapes] ...
+        cannot be broadcast`` when a clause's trailing slice is a different length
+        — it killed even the short "One sec." ack. Generating each sentence whole
+        avoids that concat entirely; we already synthesize one short clause at a
+        time, so there's nothing to gain from sub-clause streaming.
+        """
         return self._model.generate(  # type: ignore[union-attr]
             text=clause,
             voice=self._voice,
             lang_code=_LANG_CODE,
-            stream=True,
-            streaming_interval=_STREAMING_INTERVAL,
+            stream=False,
         )
 
 

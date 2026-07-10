@@ -13,6 +13,11 @@ dependencies = [
     # (swapping to an MCP stdio child is a config change, not a code change).
     # Pulls faiss-cpu / numpy / ollama / python-frontmatter / fastmcp transitively.
     "obsidian-rag",
+    # External inputs: per-user Google OAuth (Gmail + Calendar read). Installed-app
+    # flow only — no service account / domain-wide delegation (no admin needed).
+    "google-api-python-client>=2.0",
+    "google-auth>=2.0",
+    "google-auth-oauthlib>=1.0",
 ]
 
 [project.optional-dependencies]

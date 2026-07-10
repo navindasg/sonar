@@ -13,3 +13,12 @@ todo_add: local
 todo_done: local
 todo_list: local
 state_read: local
+# External inputs (read-only). gmail/calendar read the user's own account via
+# per-user OAuth; web.search is the one capability that leaves the machine. All
+# read-only, so auto-run inside a voice turn. (Draft/send email will be `gated`.)
+gmail.search: local
+calendar.agenda: local
+# calendar.create WRITES an event to the user's own calendar — kept local
+# (low-consequence, reversible) so it works in a voice turn, unlike email send.
+calendar.create: local
+web.search: local

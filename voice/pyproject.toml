@@ -23,7 +23,7 @@ dependencies = [
   "mlx>=0.18",
   "mlx-lm>=0.18",
   "parakeet-mlx==0.5.2",
-  "mlx-audio[tts]==0.4.4",
+  "mlx-audio[tts]==0.4.5",   # 0.4.5 fixes a Kokoro vocoder broadcast crash
   "misaki[en]>=0.7",        # Kokoro G2P (English extra pulls num2words/spacy)
   "silero-vad==6.2.1",
 ]
