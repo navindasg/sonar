@@ -55,6 +55,7 @@ import contextlib
 import json
 import logging
 import os
+import random
 import sys
 from collections import deque
 from typing import Any, AsyncIterator
@@ -72,6 +73,7 @@ from osvoice.vad import Endpointer, VadEvent  # noqa: E402
 
 from audio_io import OutputPlayer, rms_pcm16  # noqa: E402
 from echo_gate import EchoGate  # noqa: E402
+from acks import next_ack  # noqa: E402
 from harness_client import DELTA, STEP, stream_turn  # noqa: E402
 from history import append_turn  # noqa: E402
 
@@ -90,8 +92,10 @@ MIN_UTTER_SAMPLES = SAMPLE_RATE // 5  # ignore <200 ms slivers (too short for pa
 PREROLL_FRAMES = 8                   # ~256 ms of pre-speech kept for lead-in
 
 # Short spoken ack the instant a turn starts, to cover the harness's blocking
-# tool loop (~8 s on tool turns) so voice turns never open with dead air.
-ACK_TEXT = os.environ.get("SONAR_VOICE_ACK", "One sec.")
+# tool loop (~8 s on tool turns) so voice turns never open with dead air. Rotated
+# per turn (see acks.py) so it isn't the same phrase every time; set SONAR_VOICE_ACK
+# to force one fixed phrase instead.
+ACK_TEXT = os.environ.get("SONAR_VOICE_ACK", "").strip()
 DUCK_GAIN = float(os.environ.get("SONAR_VOICE_DUCK_GAIN", "0.35"))
 
 # Conversation memory within one F5 session: prior turns ride along so follow-ups
@@ -125,6 +129,8 @@ class VoiceLoop:
         self.speaking = False
         self._response_task: asyncio.Task[None] | None = None
         self.history: list[dict[str, str]] = []  # session memory (bounded)
+        self._ack_rng = random.Random()          # rotate acks; avoid back-to-back repeats
+        self._last_ack: str | None = None
 
     async def load(self) -> None:
         print("[voice] loading parakeet STT (first run downloads ~1-2GB)…", flush=True)
@@ -361,7 +367,10 @@ class VoiceLoop:
         delta_q: asyncio.Queue[str | None] = asyncio.Queue()
         pump = asyncio.create_task(self._pump(ws, messages, delta_q))
         try:
-            await self._speak_clause(ACK_TEXT)  # covers the blocking tool loop
+            # Rotate the ack so it isn't "One sec." every turn (env forces a fixed one).
+            ack = ACK_TEXT or next_ack(self._last_ack, self._ack_rng)
+            self._last_ack = ack
+            await self._speak_clause(ack)  # covers the blocking tool loop
             async for clause in aggregate(self._drain_deltas(delta_q)):
                 await self._speak_clause(clause)
             answer = await pump
