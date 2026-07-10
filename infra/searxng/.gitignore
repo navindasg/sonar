@@ -1,0 +1,3 @@
+# The live instance dir holds settings.yml WITH the generated secret_key, plus
+# any runtime cache. Never commit it — regenerate from settings.template.yml.
+instance/

@@ -14,6 +14,8 @@
 #   scripts/sonar.sh status        # ports, /health, models Ollama has resident
 #   scripts/sonar.sh logs          # tail -f both logs (Ctrl-C to stop tailing)
 #   scripts/sonar.sh ask "..."     # one-shot question against the running harness
+#   scripts/sonar.sh voice         # full voice loop (mic->STT->harness->TTS), foreground
+#   scripts/sonar.sh google-auth   # one-time browser consent for Gmail + Calendar (read-only)
 #
 # Config (all optional, override via env):
 #   SONAR_HOME        state dir for logs/pids   (default ~/.sonar)
@@ -26,6 +28,14 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Load config/.env early (gitignored: web-search provider/key, Google token paths,
+# any SONAR_* overrides) so its values feed both the ${VAR:-default} config below
+# AND every process we spawn — the harness reads straight from os.environ. `set -a`
+# exports each assignment so `uv run` children inherit it.
+if [ -f "$REPO_ROOT/config/.env" ]; then
+  set -a; . "$REPO_ROOT/config/.env"; set +a
+fi
 
 # --- config (override via env) ----------------------------------------------
 SONAR_HOME="${SONAR_HOME:-$HOME/.sonar}"
@@ -83,10 +93,8 @@ _wait_for() {  # _wait_for <label> <predicate-cmd...> — poll ~120s
   return 1
 }
 
-# --- subcommands ------------------------------------------------------------
-cmd_up() {
-  mkdir -p "$LOG_DIR" "$RUN_DIR"
-
+# Ollama + vault must be present before we start anything model-backed.
+_preflight() {
   if ! curl -sf "${OLLAMA_URL}/api/tags" >/dev/null 2>&1; then
     echo "error: Ollama not reachable at ${OLLAMA_URL} — start it with 'ollama serve'." >&2
     exit 1
@@ -95,23 +103,32 @@ cmd_up() {
     echo "error: vault not found at '${VAULT_PATH}' (set SONAR_VAULT_PATH)." >&2
     exit 1
   fi
+}
 
-  # Harness ------------------------------------------------------------------
+# Start the harness daemon on :$HARNESS_PORT if it isn't already up.
+_start_harness() {
   if _port_up "$HARNESS_PORT"; then
     echo "harness already up on :${HARNESS_PORT}"
-  else
-    echo "starting harness on :${HARNESS_PORT} (vault: ${VAULT_PATH}) ..."
-    _spawn "$RUN_DIR/harness.pid" "$LOG_DIR/harness.log" \
-      env SONAR_PORT="$HARNESS_PORT" \
-          SONAR_VAULT_PATH="$VAULT_PATH" \
-          SONAR_VAULT_NAME="$VAULT_NAME" \
-          SONAR_OLLAMA_URL="$OLLAMA_URL" \
-          PYTHONUNBUFFERED=1 \
-          uv run --project harness python -u -m sonar_harness
-    _wait_for "harness /health" _health \
-      || { echo "  see $LOG_DIR/harness.log"; tail -n 15 "$LOG_DIR/harness.log" >&2; exit 1; }
-    echo "  harness ready."
+    return 0
   fi
+  echo "starting harness on :${HARNESS_PORT} (vault: ${VAULT_PATH}) ..."
+  _spawn "$RUN_DIR/harness.pid" "$LOG_DIR/harness.log" \
+    env SONAR_PORT="$HARNESS_PORT" \
+        SONAR_VAULT_PATH="$VAULT_PATH" \
+        SONAR_VAULT_NAME="$VAULT_NAME" \
+        SONAR_OLLAMA_URL="$OLLAMA_URL" \
+        PYTHONUNBUFFERED=1 \
+        uv run --project harness python -u -m sonar_harness
+  _wait_for "harness /health" _health \
+    || { echo "  see $LOG_DIR/harness.log"; tail -n 15 "$LOG_DIR/harness.log" >&2; exit 1; }
+  echo "  harness ready."
+}
+
+# --- subcommands ------------------------------------------------------------
+cmd_up() {
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  _preflight
+  _start_harness
 
   # Bridge -------------------------------------------------------------------
   if _port_up "$GLOW_PORT"; then
@@ -136,7 +153,49 @@ cmd_up() {
   echo
   echo "Test it:   scripts/sonar.sh ask \"According to my notes, what reverse proxy does AIAM use?\""
   echo "Overlay:   press F5, type a question, Enter (expand the panel for steps)."
+  echo "Voice:     scripts/sonar.sh voice   (mic->STT->harness->TTS; takes over :${GLOW_PORT})"
   echo "Logs:      scripts/sonar.sh logs"
+}
+
+# Full voice loop, run in the FOREGROUND: it needs mic + speaker, whose macOS
+# permissions bind to the launching terminal, and you'll want to watch the
+# STT/TTS logs live. It serves the overlay on :$GLOW_PORT, so it takes that port
+# over from the typed bridge (stopped here if running). Ctrl-C returns you to the
+# typed bridge via `scripts/sonar.sh up`.
+cmd_voice() {
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  _preflight
+  _start_harness
+
+  # The typed bridge and the voice loop both serve the overlay on :$GLOW_PORT;
+  # only one can hold it. Hand the port to the voice loop.
+  if _port_up "$GLOW_PORT"; then
+    echo "freeing :${GLOW_PORT} (stopping typed bridge for the voice loop) ..."
+    lsof -ti "tcp:$GLOW_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
+    rm -f "$RUN_DIR/bridge.pid"
+    _wait_for ":${GLOW_PORT} free" bash -c "! lsof -ti tcp:${GLOW_PORT} >/dev/null 2>&1" || true
+  fi
+
+  _ensure_hammerspoon
+  echo
+  echo "starting voice loop on :${GLOW_PORT} — press F5, speak, listen. Ctrl-C to stop."
+  echo "(first run downloads STT + TTS models and prompts for Microphone access)"
+  echo
+  # Foreground exec: inherits this terminal's TTY + mic/speaker TCC grants.
+  cd "$REPO_ROOT/voice" && exec env \
+    SONAR_HARNESS_URL="http://127.0.0.1:${HARNESS_PORT}" \
+    SONAR_GLOW_PORT="$GLOW_PORT" \
+    PYTHONUNBUFFERED=1 \
+    uv run voice_loop.py
+}
+
+# One-time Google consent for Gmail + Calendar (read-only, per-user OAuth — no
+# admin needed). Foreground: it opens a browser for you to approve, then saves a
+# self-refreshing token under ~/.config/sonar. See harness/sonar_harness/
+# google_auth.py for the zero-admin Google Cloud Console setup steps.
+cmd_google_auth() {
+  echo "Opening Google consent (one-time). A browser window will open — approve read-only access."
+  cd "$REPO_ROOT" && exec uv run --project harness python -m sonar_harness.google_auth
 }
 
 cmd_down() {
@@ -192,6 +251,20 @@ print(f"\n[{dt:.1f}s · model={r.get('model')} · tool_calls={xs.get('tool_calls
 PY
 }
 
+# Self-hosted SearXNG for the web.search tool (private metasearch, no vendor key).
+# Thin lifecycle wrapper over infra/searxng/{up.sh,docker-compose.yml}.
+cmd_searxng() {
+  local action="${1:-up}"
+  local dir="$REPO_ROOT/infra/searxng"
+  case "$action" in
+    up)     "$dir/up.sh" ;;
+    down)   ( cd "$dir" && docker compose down ) ;;
+    logs)   ( cd "$dir" && docker compose logs -f --tail=40 ) ;;
+    status) ( cd "$dir" && docker compose ps ) ;;
+    *) echo "usage: sonar.sh searxng [up|down|logs|status]" >&2; exit 1 ;;
+  esac
+}
+
 main() {
   local sub="${1:-}"; shift || true
   case "$sub" in
@@ -200,11 +273,14 @@ main() {
     restart) cmd_down; echo; cmd_up ;;
     status)  cmd_status ;;
     logs)    cmd_logs ;;
-    ask)     cmd_ask "$@" ;;
+    ask)         cmd_ask "$@" ;;
+    voice)       cmd_voice ;;
+    google-auth) cmd_google_auth ;;
+    searxng)     cmd_searxng "$@" ;;
     ""|-h|--help|help)
-      sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+      sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
     *)
-      echo "unknown command: $sub (try: up | down | restart | status | logs | ask)" >&2
+      echo "unknown command: $sub (try: up | down | restart | status | logs | ask | voice | google-auth | searxng)" >&2
       exit 1 ;;
   esac
 }

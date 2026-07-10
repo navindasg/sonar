@@ -1,0 +1,28 @@
+# SearXNG for Sonar's web.search tool — a private, self-hosted metasearch engine.
+#
+# One container, localhost-only. No Redis/Valkey: that dependency exists only for
+# the bot-limiter, and a single private user runs with `limiter: false`, so it is
+# dropped entirely (see settings.template.yml). Bring it up with ./up.sh, which
+# generates instance/settings.yml (with a fresh secret_key) on first run.
+#
+#   ./up.sh                 # first-run secret + compose up + JSON smoke test
+#   docker compose logs -f  # tail
+#   docker compose down     # stop
+#
+# Sonar reaches it via SONAR_SEARXNG_URL=http://127.0.0.1:8888 (config/.env).
+services:
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: sonar-searxng
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8080"        # localhost only; container listens on 8080
+    volumes:
+      - ./instance:/etc/searxng:rw   # our settings.yml (gitignored: holds the secret)
+    environment:
+      SEARXNG_BASE_URL: "http://127.0.0.1:8888/"
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "1"
