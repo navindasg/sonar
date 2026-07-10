@@ -56,6 +56,41 @@ def _first_user_text(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _chat_or_fallback(
+    ollama: OllamaChat,
+    model: str,
+    fallback_model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    models: ModelsConfig,
+    emit,
+) -> tuple[dict[str, Any], str]:
+    """Call ``model``; on failure, retry once on the always-on fast model.
+
+    A missing or broken escalation model (e.g. the 12b/26b not pulled, or evicted
+    mid-turn) then degrades gracefully to the pinned fast model instead of
+    500-ing the whole turn. Returns ``(message, effective_model)`` so the loop
+    keeps using whichever model actually answered.
+    """
+    try:
+        message = ollama.chat(
+            model, messages, tools, keep_alive=models.keep_alive_for(model)
+        )
+        return message, model
+    except RuntimeError:
+        if model == fallback_model:
+            raise  # the fast model itself failed — nothing left to fall back to
+        log.warning("model %s failed; falling back to %s", model, fallback_model)
+        emit({"step": "model_switch", "detail": f"fallback→{fallback_model}"})
+        message = ollama.chat(
+            fallback_model,
+            messages,
+            tools,
+            keep_alive=models.keep_alive_for(fallback_model),
+        )
+        return message, fallback_model
+
+
 def run_turn(
     *,
     inbound_messages: list[dict[str, Any]],
@@ -83,6 +118,7 @@ def run_turn(
     if difficulty_escalated:
         emit({"step": "model_switch", "detail": f"difficulty→reason: {model}"})
     reason_model = models.resolve(models.escalation)
+    fast_model = models.resolve(models.default)
     log.info("turn=%s model=%s", turn_id, model)
 
     # Preserve prior conversation (user/assistant/tool) from the request, but
@@ -104,7 +140,12 @@ def run_turn(
     iteration = 0
 
     for iteration in range(1, MAX_TOOL_ITERATIONS + 1):
-        message = ollama.chat(model, messages, tools)
+        # Per-model keep_alive: the pinned fast model stays warm; the on-demand
+        # reasoner uses its short idle TTL so it only holds RAM while in use. If
+        # the escalation model is unavailable, degrade to fast instead of failing.
+        message, model = _chat_or_fallback(
+            ollama, model, fast_model, messages, tools, models, emit
+        )
         calls, via = extract_tool_calls(message, tool_names)
         parse_paths.append(via)
 

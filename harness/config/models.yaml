@@ -1,26 +1,71 @@
 # Sonar model router config (ported/adapted from brook37 config/models.yaml).
 #
 # Precedence chain (see sonar_harness/model_router.py):
-#   1. per-turn escalation classifier  -> STUBBED for a future pass
+#   1. per-turn difficulty classifier  -> escalate hard turns to `reason`
 #   2. global default
 #
 # Sonar adaptation vs brook37: local Ollama aliases instead of Anthropic ids.
-# Tool-selection turns run on the fast model; the escalate hook is wired but
-# the classifier that would flip a turn to `reason` is not built yet.
 
-default: fast          # gemma4:e4b-mlx — voice / chit-chat / routing / tool-select
-escalation: reason     # gemma4:26b-mlx — deep reasoning / grounded synthesis
+default: fast          # gemma4:e4b-mlx  — voice / chit-chat / routing / tool-select
+escalation: reason     # gemma4:12b-mlx  — smart AND fast enough for interactive turns
 
-# When a turn actually invoked tools, redo the FINAL grounded answer on the
-# escalation model. The fast model selects tools reliably but synthesizes weakly.
-#
-# OFF for now (plumbing/overlay testing): on a 36 GB machine e4b (11 GB) + 26b
-# (~18 GB) don't comfortably co-reside, so escalation evicts the hot model and
-# swaps the 26b in — a single tool turn was measured at 275 s that way. Warm
-# e4b-only turns are ~1 s. Re-enable once the 26b path is tuned (dedicated
-# keep_alive / fits-in-memory check / a per-turn classifier).
+# Per-turn difficulty router (model_router.wants_escalation): a cheap, zero-latency
+# classifier. A turn escalates to `reason` when it's long/involved (min_words) or
+# its wording matches a reasoning/drafting trigger; short chit-chat + tool lookups
+# stay on `fast`. Escalated turns run the WHOLE turn (incl. tool selection) on the
+# mid-tier model — which selects tools more reliably AND synthesizes better than
+# e4b. `reason` is the 12b (not 26b): live-measured, the 26b was 140-260 s/turn on
+# a 36 GB Mac (too slow for voice); the 12b-mlx is a small (~7.7 GB) MLX model that
+# runs in seconds. Tune freely: triggers are case-insensitive regex fragments.
+difficulty:
+  enabled: true
+  min_words: 40
+  triggers:
+    - 'analy[sz]e'
+    - 'analysis'
+    - 'compare'
+    - 'comparison'
+    - 'contrast'
+    - 'explain'
+    - '\bwhy\b'
+    - 'summar(?:ize|ise|y)'
+    - 'synthesi[sz]e'
+    - 'brainstorm'
+    - 'pros and cons'
+    - 'trade[- ]?offs?'
+    - 'recommend'
+    - 'evaluate'
+    - 'assess'
+    - 'strateg(?:y|ize|ise)'
+    - '\bplan\b'
+    - 'decide'
+    - 'decision'
+    - 'should i\b'
+    - 'step[- ]by[- ]step'
+    - 'outline'
+    - 'draft'
+    - 'write (?:me|a|an|up)'
+    - 'implications?'
+
+# Per-model Ollama keep_alive (seconds int, -1 = pin forever, or a Go duration
+# string like "8m"). `fast` is pinned (voice/routing must stay warm). `reason`
+# (12b, ~7.7 GB) is pinned too but NOT warmed at startup — it loads on the first
+# hard turn (~10-20 s) and then stays resident for instant hard turns after. It's
+# small enough to co-reside with e4b (~16.5 GB total on 36 GB). `deep` (26b) is
+# kept for background/batch only (workers), never interactive — transient TTL so
+# it frees its ~18 GB when idle.
+keep_alive:
+  fast: -1
+  reason: -1
+  deep: "8m"
+
+# When a turn used tools, redo the FINAL grounded answer on `reason`. Left OFF:
+# the difficulty classifier already routes hard turns fully to the 12b, so this
+# would just add a second pass to EVERY tool turn (incl. easy calendar/todo
+# lookups). Turn on only if e4b's post-tool synthesis proves weak in practice.
 escalate_synthesis_after_tools: false
 
 aliases:
   fast: "gemma4:e4b-mlx"
-  reason: "gemma4:26b-mlx"
+  reason: "gemma4:12b-mlx"   # mid-tier: smart, and seconds-not-minutes on 36 GB
+  deep: "gemma4:26b-mlx"     # heavy reasoner — background/batch only (too slow live)

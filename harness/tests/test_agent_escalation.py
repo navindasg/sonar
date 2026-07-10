@@ -41,8 +41,10 @@ class _FakeOllama:
         self._scripted = list(scripted)
         self.models_called: list[str] = []
 
-    def chat(self, model, messages, tools=None, *, temperature=0.0):  # noqa: ANN001
+    def chat(self, model, messages, tools=None, *, temperature=0.0, keep_alive=None):  # noqa: ANN001
         self.models_called.append(model)
+        self.keep_alive_called = getattr(self, "keep_alive_called", [])
+        self.keep_alive_called.append(keep_alive)
         return self._scripted.pop(0)
 
 
@@ -92,3 +94,43 @@ def test_chitchat_stays_on_fast_model():
     assert fake.models_called == [FAST]
     assert result.model == FAST
     assert result.tool_calls == 0
+
+
+class _FailOnReason:
+    """Fake Ollama that errors on the REASON model but answers on FAST."""
+
+    def __init__(self, final):
+        self._final = final
+        self.models_called: list[str] = []
+
+    def chat(self, model, messages, tools=None, *, temperature=0.0, keep_alive=None):  # noqa: ANN001
+        self.models_called.append(model)
+        if model == REASON:
+            raise RuntimeError("model not available (e.g. not pulled)")
+        return self._final
+
+
+def test_escalated_turn_falls_back_when_reason_model_unavailable():
+    # The difficulty router escalates "analyze ..." to REASON; REASON errors, so
+    # the turn must degrade to FAST instead of 500-ing.
+    models = ModelsConfig(
+        default="fast",
+        escalation="reason",
+        aliases={"fast": FAST, "reason": REASON},
+        difficulty_enabled=True,
+        difficulty_triggers=("analyze",),
+        escalate_synthesis_after_tools=False,
+    )
+    fake = _FailOnReason({"content": "Here is the analysis.", "tool_calls": []})
+    result = run_turn(
+        inbound_messages=[{"role": "user", "content": "analyze this for me"}],
+        charter="You are Sonar.",
+        registry=ToolRegistry(tools=[], permissions={}),
+        ollama=fake,
+        models=models,
+        state=None,
+        events=EventSink(),
+    )
+    assert fake.models_called[0] == REASON   # tried the escalation model first
+    assert result.model == FAST              # then fell back to fast
+    assert result.text == "Here is the analysis."
