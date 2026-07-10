@@ -12,6 +12,9 @@ rag.note_context: local
 todo_add: local
 todo_done: local
 todo_list: local
+# note.capture WRITES a note into the vault, but append-only and confined to
+# Sonar's own Sonar/ folder — safe/reversible, so it runs inside a voice turn.
+note.capture: local
 state_read: local
 # External inputs (read-only). gmail/calendar read the user's own account via
 # per-user OAuth; web.search is the one capability that leaves the machine. All
