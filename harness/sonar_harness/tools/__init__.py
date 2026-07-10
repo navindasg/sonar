@@ -14,12 +14,16 @@ from sonar_harness.tools.base import (
     ToolContext,
     ToolRegistry,
 )
+from sonar_harness.tools.calendar_read import CalendarAgendaTool
+from sonar_harness.tools.calendar_write import CalendarCreateTool
+from sonar_harness.tools.gmail_read import GmailSearchTool
 from sonar_harness.tools.rag_backend import RagBackend
 from sonar_harness.tools.rag_tools import RagNoteContextTool, RagSearchTool
 from sonar_harness.tools.state_read import StateReadTool
 from sonar_harness.tools.todo_add import TodoAddTool
 from sonar_harness.tools.todo_done import TodoDoneTool
 from sonar_harness.tools.todo_list import TodoListTool
+from sonar_harness.tools.web_search import WebSearchTool
 
 __all__ = [
     "Permission",
@@ -33,6 +37,10 @@ __all__ = [
     "TodoAddTool",
     "TodoDoneTool",
     "TodoListTool",
+    "GmailSearchTool",
+    "CalendarAgendaTool",
+    "CalendarCreateTool",
+    "WebSearchTool",
     "default_tools",
 ]
 
@@ -53,4 +61,11 @@ def default_tools(*, rag_backend: RagBackend, vault_path: str) -> list[ToolBase]
         TodoAddTool(),
         TodoDoneTool(),
         TodoListTool(vault_path=vault_path),
+        # External inputs. These read their credentials / config from
+        # env + ~/.config/sonar at call time, so they need no constructor args;
+        # when unconfigured they return a "not connected" string, not an error.
+        GmailSearchTool(),
+        CalendarAgendaTool(),
+        CalendarCreateTool(),
+        WebSearchTool(),
     ]
