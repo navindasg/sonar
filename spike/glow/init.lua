@@ -209,10 +209,17 @@ function M.setTranscript(t)
   end
 end
 
--- Accumulate turns: live partials of the current turn append to whatever has
--- already been finalized this session, so pausing between phrases doesn't wipe
--- the box. A final turn commits; the next turn's partials append after it.
+-- Accumulate the CURRENT utterance: live partials append to whatever has already
+-- been finalized this utterance, so pausing between phrases doesn't wipe the box.
+-- But once a turn has fully answered (turnDone), the next utterance is a brand-new
+-- exchange: wipe the previous answer + steps and start the transcript fresh, so
+-- speaking again gives a clean box instead of piling onto the last turn.
 function M.onTranscript(text, partial)
+  if M.turnDone then
+    M.turnDone = false
+    M.committed = ""
+    M.evalBar("window.sonar && sonar.clearTurn()")
+  end
   local joined = (M.committed ~= "" and (M.committed .. " ") or "") .. text
   if not partial then M.committed = joined end
   M.setTranscript(joined)
@@ -293,7 +300,10 @@ connect = function()
         end
         if type(data.step) == "table" then M.renderStep(data.step) end
         if data.turn == "start" then M.evalBar("window.sonar && sonar.setBusy(true)")
-        elseif data.turn == "end" then M.evalBar("window.sonar && sonar.setBusy(false)") end
+        elseif data.turn == "end" then
+          M.evalBar("window.sonar && sonar.setBusy(false)")
+          M.turnDone = true   -- next utterance clears the box (see M.onTranscript)
+        end
       else
         print("[sonar-rx] decode failed: " .. tostring(message))
       end
