@@ -21,7 +21,10 @@ state_read: local
 # read-only, so auto-run inside a voice turn. (Draft/send email will be `gated`.)
 gmail.search: local
 calendar.agenda: local
-# calendar.create WRITES an event to the user's own calendar — kept local
-# (low-consequence, reversible) so it works in a voice turn, unlike email send.
+# calendar.create/reschedule/cancel WRITE to the user's own calendar — kept local
+# (low-consequence, reversible: a move can move back, a delete lands in Trash) so
+# they work in a voice turn, unlike email send. The model confirms before writing.
 calendar.create: local
+calendar.reschedule: local
+calendar.cancel: local
 web.search: local

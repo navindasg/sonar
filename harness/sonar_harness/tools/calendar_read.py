@@ -26,7 +26,12 @@ def _event_start(event: dict[str, Any]) -> str:
 
 
 def render_events(events: list[dict[str, Any]]) -> str:
-    """Render Calendar events into compact model-readable lines."""
+    """Render Calendar events into compact model-readable lines.
+
+    Each line carries the event ``id`` (when present) so the model can pass it to
+    ``calendar.reschedule`` / ``calendar.cancel`` — it summarizes for the user and
+    does not read the id aloud.
+    """
     if not events:
         return "No events in that window."
     lines: list[str] = []
@@ -35,7 +40,9 @@ def render_events(events: list[dict[str, Any]]) -> str:
         summary = str(ev.get("summary", "(no title)")).strip()
         location = str(ev.get("location", "")).strip()
         tail = f" @ {location}" if location else ""
-        lines.append(f"[{i}] {when} — {summary}{tail}")
+        eid = str(ev.get("id", "")).strip()
+        idtag = f"  [id: {eid}]" if eid else ""
+        lines.append(f"[{i}] {when} — {summary}{tail}{idtag}")
     return "\n".join(lines)
 
 
