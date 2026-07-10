@@ -27,4 +27,6 @@ calendar.agenda: local
 calendar.create: local
 calendar.reschedule: local
 calendar.cancel: local
+# daily.brief composes read-only agenda + todos (+ optional email); read-only.
+daily.brief: local
 web.search: local

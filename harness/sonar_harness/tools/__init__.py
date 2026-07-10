@@ -20,6 +20,7 @@ from sonar_harness.tools.calendar_write import (
     CalendarCreateTool,
     CalendarRescheduleTool,
 )
+from sonar_harness.tools.daily_brief import DailyBriefTool
 from sonar_harness.tools.gmail_read import GmailSearchTool
 from sonar_harness.tools.note_capture import NoteCaptureTool
 from sonar_harness.tools.rag_backend import RagBackend
@@ -48,6 +49,7 @@ __all__ = [
     "CalendarCreateTool",
     "CalendarRescheduleTool",
     "CalendarCancelTool",
+    "DailyBriefTool",
     "WebSearchTool",
     "default_tools",
 ]
@@ -78,5 +80,6 @@ def default_tools(*, rag_backend: RagBackend, vault_path: str) -> list[ToolBase]
         CalendarCreateTool(),
         CalendarRescheduleTool(),
         CalendarCancelTool(),
+        DailyBriefTool(vault_path=vault_path),  # composes agenda + todos (+ email)
         WebSearchTool(),
     ]
