@@ -206,7 +206,12 @@ class VoiceLoop:
                     continue
                 text = msg.get("text")
                 cmd = msg.get("cmd")
-                if isinstance(text, str) and text.strip():
+                if cmd == "say" and isinstance(text, str) and text.strip():
+                    # Proactive push (e.g. the scheduled morning brief): speak the
+                    # given text directly — NO harness turn. Checked before the
+                    # typed path so its 'text' isn't treated as a question.
+                    self._start_say(ws, text.strip())
+                elif isinstance(text, str) and text.strip():
                     self._start_response(ws, text.strip())  # typed -> harness + TTS
                 elif cmd == "start":
                     self.listening = True
@@ -330,6 +335,12 @@ class VoiceLoop:
             self._response_task.cancel()
         self._response_task = asyncio.create_task(self._respond(ws, text))
 
+    def _start_say(self, ws, text: str) -> None:
+        """Start a proactive spoken message, replacing any in-flight turn."""
+        if self._response_task is not None and not self._response_task.done():
+            self._response_task.cancel()
+        self._response_task = asyncio.create_task(self._speak_text(ws, text))
+
     async def _cancel_response(self) -> None:
         task = self._response_task
         self._response_task = None
@@ -386,6 +397,32 @@ class VoiceLoop:
             await self._send(ws, {"turn": "end"})
             await self._send(ws, {"state": "listening", "level": 0.2})
             self.speaking = False
+
+    async def _speak_text(self, ws, text: str) -> None:
+        """Speak already-composed text with NO harness turn (a proactive push, e.g.
+        the scheduled morning brief). Displays the full text in the box (visible if
+        it's open) and streams it to Kokoro clause by clause. Cancellable like a
+        normal turn, so an F5 cutoff (``_silence``) silences it too.
+        """
+        self.speaking = True
+        self.gate.reset()
+        self.player.set_gain(1.0)
+        await self._send(ws, {"turn": "start"})
+        await self._send(ws, {"answer": text, "partial": True})
+        try:
+            async for clause in aggregate(self._text_chunks(text)):
+                await self._speak_clause(clause)
+            await self._drain_playback()
+        finally:
+            await self._send(ws, {"answer": "", "partial": False})
+            await self._send(ws, {"turn": "end"})
+            state = "listening" if self.listening else "idle"
+            await self._send(ws, {"state": state, "level": 0.2 if self.listening else 0.0})
+            self.speaking = False
+
+    async def _text_chunks(self, text: str) -> AsyncIterator[str]:
+        """Yield the whole text once so ``aggregate`` can split it into clauses."""
+        yield text
 
     async def _pump(
         self, ws, messages: list[dict[str, str]], delta_q: asyncio.Queue[str | None]

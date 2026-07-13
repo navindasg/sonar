@@ -251,6 +251,42 @@ print(f"\n[{dt:.1f}s · model={r.get('model')} · tool_calls={xs.get('tool_calls
 PY
 }
 
+# Morning brief: fetch daily.brief from the harness, save a vault note, speak it
+# (if the voice loop is up). `run` does it once; `install`/`uninstall` manage the
+# 08:00 launchd schedule.
+cmd_brief() {
+  local action="${1:-run}"
+  local plist_src="$REPO_ROOT/scripts/launchd/com.sonar.morning-brief.plist"
+  local plist_dst="$HOME/Library/LaunchAgents/com.sonar.morning-brief.plist"
+  case "$action" in
+    run|"")
+      _port_up "$HARNESS_PORT" || { echo "harness not running — 'sonar.sh up' first." >&2; exit 1; }
+      cd "$REPO_ROOT" && exec env \
+        SONAR_HARNESS_URL="http://127.0.0.1:${HARNESS_PORT}" \
+        SONAR_GLOW_PORT="$GLOW_PORT" \
+        SONAR_VAULT_PATH="$VAULT_PATH" \
+        PYTHONUNBUFFERED=1 \
+        uv run scripts/morning_brief.py
+      ;;
+    install)
+      mkdir -p "$LOG_DIR" "$HOME/Library/LaunchAgents"
+      sed -e "s|__SONAR_SH__|${BASH_SOURCE[0]}|g" -e "s|__LOGDIR__|${LOG_DIR}|g" \
+        "$plist_src" > "$plist_dst"
+      launchctl unload "$plist_dst" 2>/dev/null || true
+      launchctl load "$plist_dst"
+      echo "morning brief scheduled daily at 08:00 (com.sonar.morning-brief)."
+      echo "  plist: $plist_dst"
+      echo "  note: keep the harness (+ voice loop for audio) running at 08:00."
+      ;;
+    uninstall)
+      launchctl unload "$plist_dst" 2>/dev/null || true
+      rm -f "$plist_dst"
+      echo "morning brief schedule removed."
+      ;;
+    *) echo "usage: sonar.sh brief [run|install|uninstall]" >&2; exit 1 ;;
+  esac
+}
+
 # Self-hosted SearXNG for the web.search tool (private metasearch, no vendor key).
 # Thin lifecycle wrapper over infra/searxng/{up.sh,docker-compose.yml}.
 cmd_searxng() {
@@ -277,10 +313,11 @@ main() {
     voice)       cmd_voice ;;
     google-auth) cmd_google_auth ;;
     searxng)     cmd_searxng "$@" ;;
+    brief)       cmd_brief "$@" ;;
     ""|-h|--help|help)
       sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
     *)
-      echo "unknown command: $sub (try: up | down | restart | status | logs | ask | voice | google-auth | searxng)" >&2
+      echo "unknown command: $sub (try: up | down | restart | status | logs | ask | voice | google-auth | searxng | brief)" >&2
       exit 1 ;;
   esac
 }

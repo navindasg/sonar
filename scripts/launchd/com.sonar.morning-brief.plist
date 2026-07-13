@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd LaunchAgent TEMPLATE for Sonar's morning brief.
+
+  Installed by `scripts/sonar.sh brief install`, which substitutes __SONAR_SH__
+  and __LOGDIR__ and copies it to ~/Library/LaunchAgents. launchd (not cron)
+  because cron silently skips jobs missed while the Mac is asleep — launchd runs
+  them on wake. Fires daily at 08:00 local; RunAtLoad is false so installing does
+  not immediately trigger one. The harness (and the voice loop, for audio) must be
+  running at 08:00 — the brief needs them.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sonar.morning-brief</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__SONAR_SH__</string>
+        <string>brief</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__LOGDIR__/morning-brief.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOGDIR__/morning-brief.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
