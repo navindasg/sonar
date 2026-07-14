@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd LaunchAgent TEMPLATE for the Sonar overlay bridge (WebSocket :8770).
+
+  This is the backend the Hammerspoon "glow" overlay talks to: press F5 -> the box
+  sends {"text": ...} to the bridge -> the bridge proxies to the harness -> the
+  answer streams back. Without it up, F5 shows nothing (or a disconnected box).
+
+  Installed by `scripts/sonar.sh daemon install` alongside the harness, so the
+  everyday typed-overlay stack is durable (RunAtLoad + KeepAlive) instead of a
+  session-tied process that dies between sessions. The glow (HS) is the WS client
+  and reconnects on its own, so restarting this agent needs no HS reload.
+
+  Mutually exclusive with com.sonar.voice: both bind :8770, so only one is loaded
+  at a time — `daemon install-voice` swaps this bridge off for the voice loop.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sonar.bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__SONAR_SH__</string>
+        <string>_exec-bridge</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__LOGDIR__/bridge.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOGDIR__/bridge.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

@@ -132,6 +132,30 @@ _await_ollama() {
   return 1
 }
 
+# launchd-agent lifecycle helpers (used by cmd_daemon). Templates live under
+# scripts/launchd/; __SONAR_SH__ must be the ABSOLUTE $SONAR_SH (launchd runs
+# agents from "/"), __LOGDIR__ the log dir.
+_install_agent() {  # <template-src> <installed-dst>
+  local la; la="$(dirname "$2")"; mkdir -p "$la"
+  sed -e "s|__SONAR_SH__|${SONAR_SH}|g" -e "s|__LOGDIR__|${LOG_DIR}|g" "$1" > "$2"
+  launchctl unload "$2" 2>/dev/null || true
+  launchctl load "$2"
+}
+_remove_agent() {  # <installed-dst>
+  [ -e "$1" ] || return 0
+  launchctl unload "$1" 2>/dev/null || true
+  rm -f "$1"
+}
+# Kill a manually-started (`sonar.sh up`) process still holding a port, so an
+# agent can bind it. <label> <port> <pidfile-name>
+_free_manual() {
+  if _port_up "$2"; then
+    echo "stopping manual $1 on :$2 (agent will take it) ..."
+    lsof -ti "tcp:$2" 2>/dev/null | xargs kill 2>/dev/null || true
+    rm -f "$RUN_DIR/$3"; sleep 1
+  fi
+}
+
 # Start the harness daemon on :$HARNESS_PORT if it isn't already up.
 _start_harness() {
   if _port_up "$HARNESS_PORT"; then
@@ -330,6 +354,20 @@ cmd_exec_harness() {
     uv run --project harness python -u -m sonar_harness
 }
 
+# launchd entrypoint (hidden) for the overlay bridge (WS :$GLOW_PORT; the
+# Hammerspoon glow is the client and reconnects on its own). Waits for the
+# harness it proxies to, then execs the bridge in the foreground so launchd's
+# KeepAlive can supervise it. Mutually exclusive with the voice loop on :$GLOW_PORT.
+cmd_exec_bridge() {
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  _wait_for "harness /health" _health || exit 1
+  cd "$REPO_ROOT" && exec env \
+    SONAR_HARNESS_URL="http://127.0.0.1:${HARNESS_PORT}" \
+    SONAR_GLOW_PORT="$GLOW_PORT" \
+    PYTHONUNBUFFERED=1 \
+    uv run overlay/bridge.py
+}
+
 # launchd entrypoint (hidden) for the voice loop. Waits for Ollama + the harness,
 # then frees :$GLOW_PORT from the typed bridge (only one can hold it) and execs
 # the loop in the foreground. Mic/TCC under launchd is EXPERIMENTAL — see the
@@ -358,47 +396,45 @@ cmd_daemon() {
   local action="${1:-status}"
   local la="$HOME/Library/LaunchAgents"
   local hsrc="$REPO_ROOT/scripts/launchd/com.sonar.harness.plist"
+  local bsrc="$REPO_ROOT/scripts/launchd/com.sonar.bridge.plist"
   local vsrc="$REPO_ROOT/scripts/launchd/com.sonar.voice.plist"
   local hdst="$la/com.sonar.harness.plist"
+  local bdst="$la/com.sonar.bridge.plist"
   local vdst="$la/com.sonar.voice.plist"
   case "$action" in
     install)
+      # The durable typed-overlay stack: harness (+ RAG/tools) and the bridge that
+      # backs the F5 box. Bridge and voice both bind :$GLOW_PORT, so drop any voice
+      # agent first — they're mutually exclusive.
       mkdir -p "$LOG_DIR" "$RUN_DIR" "$la"
-      # Free any manual harness (from `sonar.sh up`) so the agent can bind :8787.
-      if _port_up "$HARNESS_PORT"; then
-        echo "stopping manual harness on :${HARNESS_PORT} so the agent can take it ..."
-        lsof -ti "tcp:$HARNESS_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
-        rm -f "$RUN_DIR/harness.pid"; sleep 1
-      fi
-      sed -e "s|__SONAR_SH__|${SONAR_SH}|g" -e "s|__LOGDIR__|${LOG_DIR}|g" "$hsrc" > "$hdst"
-      launchctl unload "$hdst" 2>/dev/null || true
-      launchctl load "$hdst"
+      if [ -e "$vdst" ]; then echo "removing voice agent (bridge owns :${GLOW_PORT}) ..."; _remove_agent "$vdst"; fi
+      _free_manual harness "$HARNESS_PORT" harness.pid
+      _free_manual bridge  "$GLOW_PORT"    bridge.pid
+      _install_agent "$hsrc" "$hdst"
       echo "harness daemon installed (com.sonar.harness) — RunAtLoad + KeepAlive."
-      echo "  plist: $hdst"
-      if _wait_for "harness /health" _health; then
-        echo "  harness up on :${HARNESS_PORT}."
-      else
-        echo "  ! not healthy yet — check $LOG_DIR/harness.err.log"
-      fi
+      if _wait_for "harness /health" _health; then echo "  harness up on :${HARNESS_PORT}."; else echo "  ! not healthy yet — check $LOG_DIR/harness.err.log"; fi
+      _install_agent "$bsrc" "$bdst"
+      echo "bridge daemon installed (com.sonar.bridge) — RunAtLoad + KeepAlive."
+      if _wait_for "bridge :${GLOW_PORT}" _port_up "$GLOW_PORT"; then echo "  bridge up on :${GLOW_PORT} — F5 overlay should work."; else echo "  ! bridge not up — check $LOG_DIR/bridge.err.log"; fi
+      _ensure_hammerspoon
       echo
-      echo "The voice loop is opt-in (it holds the mic; TCC under launchd needs a live check):"
+      echo "Voice loop is opt-in (swaps the bridge off :${GLOW_PORT}; mic/TCC under launchd needs a live check):"
       echo "  scripts/sonar.sh daemon install-voice"
       ;;
     install-voice)
+      # Voice owns :$GLOW_PORT — drop the bridge agent (and any manual bridge) first.
       mkdir -p "$LOG_DIR" "$RUN_DIR" "$la"
-      sed -e "s|__SONAR_SH__|${SONAR_SH}|g" -e "s|__LOGDIR__|${LOG_DIR}|g" "$vsrc" > "$vdst"
-      launchctl unload "$vdst" 2>/dev/null || true
-      launchctl load "$vdst"
+      if [ -e "$bdst" ]; then echo "removing bridge agent (voice owns :${GLOW_PORT}) ..."; _remove_agent "$bdst"; fi
+      _free_manual bridge "$GLOW_PORT" bridge.pid
+      _install_agent "$vsrc" "$vdst"
       echo "voice daemon installed (com.sonar.voice) — RunAtLoad + KeepAlive."
-      echo "  plist: $vdst"
       echo "  ! EXPERIMENTAL: if macOS denies mic access under launchd (no prompt appears),"
       echo "    run 'scripts/sonar.sh voice' once from a terminal to grant Microphone, then"
       echo "    the agent should inherit it. Watch:  tail -f $LOG_DIR/voice.err.log"
       ;;
     uninstall)
-      launchctl unload "$hdst" 2>/dev/null || true; rm -f "$hdst"
-      launchctl unload "$vdst" 2>/dev/null || true; rm -f "$vdst"
-      echo "harness + voice daemons removed. (Use 'scripts/sonar.sh up' for a manual harness.)"
+      _remove_agent "$hdst"; _remove_agent "$bdst"; _remove_agent "$vdst"
+      echo "harness + bridge + voice daemons removed. (Use 'scripts/sonar.sh up' for a manual stack.)"
       ;;
     status)
       local found; found="$(launchctl list 2>/dev/null | grep -E 'com\.sonar' || true)"
@@ -438,6 +474,7 @@ main() {
     brief)       cmd_brief "$@" ;;
     daemon)      cmd_daemon "$@" ;;
     _exec-harness) cmd_exec_harness ;;   # hidden: launchd entrypoints (see plists)
+    _exec-bridge)  cmd_exec_bridge ;;
     _exec-voice)   cmd_exec_voice ;;
     ""|-h|--help|help)
       sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
