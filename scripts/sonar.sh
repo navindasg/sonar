@@ -212,14 +212,21 @@ cmd_up() {
 # permissions bind to the launching terminal, and you'll want to watch the
 # STT/TTS logs live. It serves the overlay on :$GLOW_PORT, so it takes that port
 # over from the typed bridge (stopped here if running). Ctrl-C returns you to the
-# typed bridge via `scripts/sonar.sh up`.
+# typed bridge via `scripts/sonar.sh daemon install` (or `up`).
 cmd_voice() {
   mkdir -p "$LOG_DIR" "$RUN_DIR"
   _preflight
   _start_harness
 
   # The typed bridge and the voice loop both serve the overlay on :$GLOW_PORT;
-  # only one can hold it. Hand the port to the voice loop.
+  # only one can hold it. If the durable bridge agent is installed, unload it —
+  # else KeepAlive would respawn it and fight the voice loop for the port.
+  local bagent="$HOME/Library/LaunchAgents/com.sonar.bridge.plist"
+  if [ -e "$bagent" ]; then
+    echo "unloading the bridge agent (voice takes over :${GLOW_PORT}) ..."
+    launchctl unload "$bagent" 2>/dev/null || true
+  fi
+  # Hand the port to the voice loop (kill any lingering typed bridge process).
   if _port_up "$GLOW_PORT"; then
     echo "freeing :${GLOW_PORT} (stopping typed bridge for the voice loop) ..."
     lsof -ti "tcp:$GLOW_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
