@@ -28,8 +28,13 @@ def test_add_persists_and_readback(tmp_path):
     add = TodoAddTool()
     read = StateReadTool()
 
+    # A future due date, computed the way expire_todos compares (local calendar
+    # date): a hardcoded date silently rots once "today" passes it — the read's
+    # expire_todos() would prune the dated todo before we assert on it.
+    future_due = (datetime.now(timezone.utc).astimezone().date() + timedelta(days=7)).isoformat()
+
     ctx, events = _ctx(state)
-    out = add.run({"text": "email the recruiter", "due": "2026-07-10"}, ctx)
+    out = add.run({"text": "email the recruiter", "due": future_due}, ctx)
     assert out.startswith("Saved to your list (#1):")
     assert events[-1]["tool"] == "todo_add" and "saved todo #1" in events[-1]["detail"]
 
@@ -37,7 +42,7 @@ def test_add_persists_and_readback(tmp_path):
     todos = json.loads(read.run({"kind": "todos"}, _ctx(state)[0]))
     # dated task sorts before the undated one
     assert [t["text"] for t in todos] == ["email the recruiter", "book flights"]
-    assert todos[0]["due"] == "2026-07-10" and todos[1]["due"] is None
+    assert todos[0]["due"] == future_due and todos[1]["due"] is None
     state.close()
 
 
