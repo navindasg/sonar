@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd LaunchAgent TEMPLATE for the Sonar harness (:8787).
+
+  Installed by `scripts/sonar.sh daemon install`, which substitutes __SONAR_SH__
+  and __LOGDIR__ and copies it to ~/Library/LaunchAgents.
+
+  Why a LaunchAgent (not the nohup/_spawn path): RunAtLoad starts the harness at
+  login and KeepAlive respawns it if it crashes or is killed, so it is durably up
+  — the fix for "the services died, so the 08:00 brief couldn't fire." It shells
+  through sonar.sh (`_exec-harness`) so env/paths/.env resolve in exactly one
+  place, and so sonar.sh can WAIT for Ollama before exec'ing the harness (the
+  harness indexes the vault through Ollama embeddings at startup and aborts if
+  Ollama is down — without the wait, KeepAlive would crash-loop at login until
+  Ollama is up). ProcessType Interactive keeps macOS from throttling it.
+
+  To stop it: `scripts/sonar.sh daemon uninstall` (KeepAlive out-lives a plain
+  `sonar.sh down`, which only kills the port).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sonar.harness</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__SONAR_SH__</string>
+        <string>_exec-harness</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__LOGDIR__/harness.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOGDIR__/harness.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

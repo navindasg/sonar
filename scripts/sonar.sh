@@ -16,6 +16,7 @@
 #   scripts/sonar.sh ask "..."     # one-shot question against the running harness
 #   scripts/sonar.sh voice         # full voice loop (mic->STT->harness->TTS), foreground
 #   scripts/sonar.sh google-auth   # one-time browser consent for Gmail + Calendar (read-only)
+#   scripts/sonar.sh daemon <cmd>  # durable launchd agents: install | install-voice | uninstall | status
 #
 # Config (all optional, override via env):
 #   SONAR_HOME        state dir for logs/pids   (default ~/.sonar)
@@ -28,6 +29,13 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# launchd starts LaunchAgents with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin)
+# that omits ~/.local/bin (uv) and Homebrew, and it does NOT source your shell
+# profile. Prepend the usual locations so `uv`/`ollama` resolve identically
+# whether we're run from a login shell, an editor, or a launchd agent — this also
+# un-breaks the 08:00 morning-brief agent, which shells out to `uv` the same way.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 # Load config/.env early (gitignored: web-search provider/key, Google token paths,
 # any SONAR_* overrides) so its values feed both the ${VAR:-default} config below
@@ -47,6 +55,11 @@ OLLAMA_URL="${SONAR_OLLAMA_URL:-http://127.0.0.1:11434}"
 
 LOG_DIR="$SONAR_HOME/logs"
 RUN_DIR="$SONAR_HOME/run"
+
+# Absolute path to THIS script, for launchd plists. Must NOT be ${BASH_SOURCE[0]}
+# — that echoes however we were invoked (e.g. the relative "scripts/sonar.sh"),
+# and launchd runs agents from "/", where a relative path fails to resolve.
+SONAR_SH="$REPO_ROOT/scripts/sonar.sh"
 
 # --- helpers ----------------------------------------------------------------
 _port_up()  { lsof -ti "tcp:$1" >/dev/null 2>&1; }
@@ -103,6 +116,20 @@ _preflight() {
     echo "error: vault not found at '${VAULT_PATH}' (set SONAR_VAULT_PATH)." >&2
     exit 1
   fi
+}
+
+# Block until Ollama answers, or give up after ~90s so launchd's KeepAlive can
+# retry cleanly. Used by the launchd exec paths: the harness indexes the vault
+# through Ollama embeddings at startup and aborts if Ollama is down, so at login
+# we wait for it (Ollama's own app may still be coming up) instead of crash-looping.
+_await_ollama() {
+  local i
+  for i in $(seq 1 90); do
+    curl -sf "${OLLAMA_URL}/api/tags" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  echo "error: Ollama not reachable at ${OLLAMA_URL} after 90s — retrying." >&2
+  return 1
 }
 
 # Start the harness daemon on :$HARNESS_PORT if it isn't already up.
@@ -270,7 +297,7 @@ cmd_brief() {
       ;;
     install)
       mkdir -p "$LOG_DIR" "$HOME/Library/LaunchAgents"
-      sed -e "s|__SONAR_SH__|${BASH_SOURCE[0]}|g" -e "s|__LOGDIR__|${LOG_DIR}|g" \
+      sed -e "s|__SONAR_SH__|${SONAR_SH}|g" -e "s|__LOGDIR__|${LOG_DIR}|g" \
         "$plist_src" > "$plist_dst"
       launchctl unload "$plist_dst" 2>/dev/null || true
       launchctl load "$plist_dst"
@@ -284,6 +311,101 @@ cmd_brief() {
       echo "morning brief schedule removed."
       ;;
     *) echo "usage: sonar.sh brief [run|install|uninstall]" >&2; exit 1 ;;
+  esac
+}
+
+# launchd entrypoint (hidden): run the harness in the FOREGROUND so launchd is its
+# parent and KeepAlive can supervise it. No _spawn/nohup here — detaching would
+# defeat launchd's supervision. Waits for Ollama first (see _await_ollama).
+cmd_exec_harness() {
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  [ -d "$VAULT_PATH" ] || { echo "error: vault not found at '${VAULT_PATH}'." >&2; exit 1; }
+  _await_ollama || exit 1
+  cd "$REPO_ROOT" && exec env \
+    SONAR_PORT="$HARNESS_PORT" \
+    SONAR_VAULT_PATH="$VAULT_PATH" \
+    SONAR_VAULT_NAME="$VAULT_NAME" \
+    SONAR_OLLAMA_URL="$OLLAMA_URL" \
+    PYTHONUNBUFFERED=1 \
+    uv run --project harness python -u -m sonar_harness
+}
+
+# launchd entrypoint (hidden) for the voice loop. Waits for Ollama + the harness,
+# then frees :$GLOW_PORT from the typed bridge (only one can hold it) and execs
+# the loop in the foreground. Mic/TCC under launchd is EXPERIMENTAL — see the
+# plist comment and `daemon install-voice`.
+cmd_exec_voice() {
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  _await_ollama || exit 1
+  _wait_for "harness /health" _health || exit 1
+  if _port_up "$GLOW_PORT"; then
+    lsof -ti "tcp:$GLOW_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
+    rm -f "$RUN_DIR/bridge.pid"
+    _wait_for ":${GLOW_PORT} free" bash -c "! lsof -ti tcp:${GLOW_PORT} >/dev/null 2>&1" || true
+  fi
+  cd "$REPO_ROOT/voice" && exec env \
+    SONAR_HARNESS_URL="http://127.0.0.1:${HARNESS_PORT}" \
+    SONAR_GLOW_PORT="$GLOW_PORT" \
+    PYTHONUNBUFFERED=1 \
+    uv run voice_loop.py
+}
+
+# Durable launchd LaunchAgents (RunAtLoad + KeepAlive): the harness — and, opt-in,
+# the voice loop — start at login and respawn on crash. This is the fix for
+# "the services died between sessions, so the 08:00 brief couldn't fire", and the
+# first real step toward the packaged, always-on app.
+cmd_daemon() {
+  local action="${1:-status}"
+  local la="$HOME/Library/LaunchAgents"
+  local hsrc="$REPO_ROOT/scripts/launchd/com.sonar.harness.plist"
+  local vsrc="$REPO_ROOT/scripts/launchd/com.sonar.voice.plist"
+  local hdst="$la/com.sonar.harness.plist"
+  local vdst="$la/com.sonar.voice.plist"
+  case "$action" in
+    install)
+      mkdir -p "$LOG_DIR" "$RUN_DIR" "$la"
+      # Free any manual harness (from `sonar.sh up`) so the agent can bind :8787.
+      if _port_up "$HARNESS_PORT"; then
+        echo "stopping manual harness on :${HARNESS_PORT} so the agent can take it ..."
+        lsof -ti "tcp:$HARNESS_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
+        rm -f "$RUN_DIR/harness.pid"; sleep 1
+      fi
+      sed -e "s|__SONAR_SH__|${SONAR_SH}|g" -e "s|__LOGDIR__|${LOG_DIR}|g" "$hsrc" > "$hdst"
+      launchctl unload "$hdst" 2>/dev/null || true
+      launchctl load "$hdst"
+      echo "harness daemon installed (com.sonar.harness) — RunAtLoad + KeepAlive."
+      echo "  plist: $hdst"
+      if _wait_for "harness /health" _health; then
+        echo "  harness up on :${HARNESS_PORT}."
+      else
+        echo "  ! not healthy yet — check $LOG_DIR/harness.err.log"
+      fi
+      echo
+      echo "The voice loop is opt-in (it holds the mic; TCC under launchd needs a live check):"
+      echo "  scripts/sonar.sh daemon install-voice"
+      ;;
+    install-voice)
+      mkdir -p "$LOG_DIR" "$RUN_DIR" "$la"
+      sed -e "s|__SONAR_SH__|${SONAR_SH}|g" -e "s|__LOGDIR__|${LOG_DIR}|g" "$vsrc" > "$vdst"
+      launchctl unload "$vdst" 2>/dev/null || true
+      launchctl load "$vdst"
+      echo "voice daemon installed (com.sonar.voice) — RunAtLoad + KeepAlive."
+      echo "  plist: $vdst"
+      echo "  ! EXPERIMENTAL: if macOS denies mic access under launchd (no prompt appears),"
+      echo "    run 'scripts/sonar.sh voice' once from a terminal to grant Microphone, then"
+      echo "    the agent should inherit it. Watch:  tail -f $LOG_DIR/voice.err.log"
+      ;;
+    uninstall)
+      launchctl unload "$hdst" 2>/dev/null || true; rm -f "$hdst"
+      launchctl unload "$vdst" 2>/dev/null || true; rm -f "$vdst"
+      echo "harness + voice daemons removed. (Use 'scripts/sonar.sh up' for a manual harness.)"
+      ;;
+    status)
+      local found; found="$(launchctl list 2>/dev/null | grep -E 'com\.sonar' || true)"
+      if [ -n "$found" ]; then echo "$found"; else echo "no com.sonar agents loaded."; fi
+      echo; cmd_status
+      ;;
+    *) echo "usage: sonar.sh daemon [install|install-voice|uninstall|status]" >&2; exit 1 ;;
   esac
 }
 
@@ -314,10 +436,13 @@ main() {
     google-auth) cmd_google_auth ;;
     searxng)     cmd_searxng "$@" ;;
     brief)       cmd_brief "$@" ;;
+    daemon)      cmd_daemon "$@" ;;
+    _exec-harness) cmd_exec_harness ;;   # hidden: launchd entrypoints (see plists)
+    _exec-voice)   cmd_exec_voice ;;
     ""|-h|--help|help)
-      sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+      sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
     *)
-      echo "unknown command: $sub (try: up | down | restart | status | logs | ask | voice | google-auth | searxng | brief)" >&2
+      echo "unknown command: $sub (try: up | down | restart | status | logs | ask | voice | google-auth | searxng | brief | daemon)" >&2
       exit 1 ;;
   esac
 }
