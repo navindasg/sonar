@@ -27,7 +27,8 @@ def test_render_has_overview_then_transcript() -> None:
     assert md.index("## AI Overview") < md.index("- numbers reviewed") < md.index("## Transcript")
     assert "**Navin** (00:00): let's start with the numbers" in md
     assert "**Speaker 2** (01:05): revenue is up eight percent" in md
-    assert "speakers: [Navin, Speaker 2]" in md
+    # Names are emitted as YAML-safe (JSON) scalars now — see the injection test.
+    assert 'speakers: ["Navin", "Speaker 2"]' in md
     assert "# Budget Review" in md
 
 
@@ -72,3 +73,34 @@ def test_resave_overwrites_the_same_file(tmp_path: Path) -> None:
 def test_missing_vault_raises(tmp_path: Path) -> None:
     with pytest.raises(OSError):
         save_note(_state(), tmp_path / "nope", NOW)
+
+
+# --- regression: #11 hostile speaker names must not inject YAML frontmatter ---
+
+def _frontmatter(md: str) -> str:
+    """The text between the first two '---' fences (the YAML frontmatter block)."""
+    parts = md.split("---")
+    assert len(parts) >= 3, "note is missing its frontmatter fences"
+    return parts[1]
+
+
+@pytest.mark.parametrize("evil_name", [
+    "Navin\ninjected: true",          # newline would break out to a top-level key
+    "Navin: boss",                    # ':' would turn the entry into a mapping
+    "[malformed] {flow}",             # YAML flow indicators
+    'quote " and # hash',             # quote + comment indicators
+])
+def test_speaker_name_cannot_inject_frontmatter(evil_name: str) -> None:
+    yaml = pytest.importorskip("yaml")
+    s = sess.SessionState(title="T", started_at="2026-07-15T14:00:00")
+    s = sess.add_segment(s, "S1", "hello", 0.0, 1.0)
+    s = sess.add_segment(s, "S2", "hi", 1.0, 2.0)
+    s = sess.rename_speaker(s, "S1", evil_name)
+
+    fm = yaml.safe_load(_frontmatter(render_note(s, NOW)))
+
+    # Parses as valid YAML with exactly the expected top-level keys — the hostile
+    # name did NOT create an "injected" (or any other) top-level key.
+    assert set(fm) == {"created", "type", "speakers", "source"}
+    # ...and it round-trips as a plain string list, the evil name preserved.
+    assert fm["speakers"] == [evil_name, "Speaker 2"]

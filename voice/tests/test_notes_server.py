@@ -82,3 +82,25 @@ async def test_broadcast_reaches_every_client_and_skips_dead_ones(served) -> Non
         await server.broadcast({"type": "partial", "text": "hello"})
         got: Any = json.loads(await asyncio.wait_for(a.recv(), timeout=2))
         assert got == {"type": "partial", "text": "hello"}
+
+
+async def test_cross_origin_ws_handshake_is_refused(served) -> None:
+    # #2 regression: WS is exempt from CORS, so a tab on evil.com could otherwise
+    # open ws://127.0.0.1:<port> and read/drive the live meeting. The server must
+    # reject a foreign Origin at the handshake (HTTP 403).
+    _ops, server = served
+    uri = f"ws://127.0.0.1:{server.port}/ws"
+    with pytest.raises(websockets.InvalidStatus) as exc:
+        async with websockets.connect(uri, origin="https://evil.com"):
+            pass  # pragma: no cover — handshake should already have failed
+    assert exc.value.response.status_code == 403
+
+
+async def test_same_origin_ws_handshake_is_accepted_and_gets_state(served) -> None:
+    # The page's own loopback origin (on the bound port) still handshakes and
+    # receives the initial state snapshot — the gate didn't lock out real users.
+    ops, server = served
+    uri = f"ws://127.0.0.1:{server.port}/ws"
+    async with websockets.connect(uri, origin=f"http://127.0.0.1:{server.port}") as ws:
+        first = json.loads(await ws.recv())
+    assert first == ops.state_json()

@@ -14,8 +14,10 @@ no-external-origins CSP.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any, Protocol
@@ -23,6 +25,10 @@ from typing import Any, Protocol
 log = logging.getLogger("sonar.notes.server")
 
 _UI_PATH = Path(__file__).with_name("ui.html")
+
+# A backgrounded/suspended tab that stops draining applies write backpressure;
+# bound every broadcast send so one such client can't freeze the pipeline worker.
+_SEND_TIMEOUT_S = 2.0
 
 
 class NotesOps(Protocol):
@@ -70,9 +76,16 @@ class NotesServer:
             return
         import websockets
 
+        # Defence in depth: accept() re-checks `origins=` after _process_request
+        # returns, so it must not reject what the exact gate allowed. The bound
+        # port is unknown here (self._port may be 0), so match loopback by host
+        # on any port and leave the exact-port decision to _process_request.
+        # None permits non-browser clients (curl, the round-trip tests) that
+        # send no Origin — browsers always send one, so evil.com can't spoof it.
         self._server = await websockets.serve(
             self._handler, self._host, self._port,
             process_request=self._process_request,
+            origins=self._serve_origins(),
         )
         log.info("notes UI on %s", self.url)
 
@@ -85,13 +98,23 @@ class NotesServer:
         self._conns.clear()
 
     async def broadcast(self, msg: dict) -> None:
-        """Best-effort fan-out; a dead connection is dropped, never fatal."""
+        """Best-effort fan-out; a dead OR slow connection is dropped, never
+        fatal. Sends run concurrently and each is bounded by a short timeout, so
+        a backgrounded tab that stops draining can't serialize-block the others
+        or freeze the single pipeline worker (which would then hang end()'s
+        queue.join() on write backpressure)."""
         data = json.dumps(msg)
-        for conn in list(self._conns):
+        conns = list(self._conns)
+        if not conns:
+            return
+
+        async def _send(conn: Any) -> None:
             try:
-                await conn.send(data)
-            except Exception:  # noqa: BLE001 — closed/broken socket
+                await asyncio.wait_for(conn.send(data), timeout=_SEND_TIMEOUT_S)
+            except Exception:  # noqa: BLE001 — slow/closed/broken socket: drop it
                 self._conns.discard(conn)
+
+        await asyncio.gather(*(_send(conn) for conn in conns))
 
     async def _handler(self, ws: Any) -> None:
         self._conns.add(ws)
@@ -113,11 +136,20 @@ class NotesServer:
             self._conns.discard(ws)
 
     def _process_request(self, conn: Any, request: Any) -> Any:
-        """Serve the UI page for plain HTTP; let WS handshakes through (None)."""
-        if is_websocket_upgrade(request.headers):
-            return None
+        """Serve the UI page for plain HTTP; let same-origin WS handshakes
+        through (None). A cross-origin WS upgrade — a tab on evil.com reaching
+        for ws://127.0.0.1:{port} to read/drive the live meeting — is refused
+        with 403 here: WS is exempt from CORS, so the server must gate it (this
+        runs before accept(), using the actual bound port)."""
         from websockets.datastructures import Headers
         from websockets.http11 import Response
+
+        if is_websocket_upgrade(request.headers):
+            if self._origin_allowed(request.headers):
+                return None
+            return Response(HTTPStatus.FORBIDDEN, "Forbidden",
+                            Headers([("Content-Type", "text/plain")]),
+                            b"cross-origin websocket refused\n")
 
         if request.path not in ("/", "/index.html"):
             return Response(HTTPStatus.NOT_FOUND, "Not Found",
@@ -127,11 +159,44 @@ class NotesServer:
             ("Content-Type", "text/html; charset=utf-8"),
             ("Content-Length", str(len(body))),
             ("Cache-Control", "no-store"),
+            # frame-ancestors 'none' keeps the page out of any <iframe>, so
+            # Discard/End/Save can't be clickjacked from a framing site.
             ("Content-Security-Policy",
              "default-src 'none'; style-src 'unsafe-inline'; "
-             "script-src 'unsafe-inline'; connect-src ws: http:; img-src data:"),
+             "script-src 'unsafe-inline'; connect-src ws: http:; img-src data:; "
+             "frame-ancestors 'none'"),
         ])
         return Response(HTTPStatus.OK, "OK", headers, body)
+
+    def _loopback_hosts(self) -> list[str]:
+        """The host the page was served as plus the loopback spellings a user
+        might open it as (deduped, order preserved)."""
+        return list(dict.fromkeys((self._host, "127.0.0.1", "localhost")))
+
+    def _allowed_origins(self) -> set[str]:
+        """The exact local origins the served page may hand shake from — its own
+        host on the *bound* port, plus loopback spellings of it."""
+        port = self.port
+        return {f"http://{host}:{port}" for host in self._loopback_hosts()}
+
+    def _serve_origins(self) -> list:
+        """`origins=` for websockets.serve: a loopback-host regex (any port,
+        since the bound port isn't known yet) as a backstop, plus None to allow
+        a missing Origin. The tight per-port check lives in _process_request."""
+        hosts = "|".join(re.escape(h) for h in self._loopback_hosts())
+        return [re.compile(rf"http://(?:{hosts})(?::\d+)?"), None]
+
+    def _origin_allowed(self, headers: Any) -> bool:
+        """True for our own local origins, or for a client that sends no Origin
+        at all (curl / the round-trip tests). A malformed or duplicated Origin
+        header is refused."""
+        try:
+            origin = headers.get("Origin")
+        except Exception:  # noqa: BLE001 — malformed/duplicate Origin: refuse
+            return False
+        if origin is None:
+            return True
+        return origin in self._allowed_origins()
 
     def _page(self) -> bytes:
         if self._html is None:
