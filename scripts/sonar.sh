@@ -243,6 +243,8 @@ cmd_voice() {
   cd "$REPO_ROOT/voice" && exec env \
     SONAR_HARNESS_URL="http://127.0.0.1:${HARNESS_PORT}" \
     SONAR_GLOW_PORT="$GLOW_PORT" \
+    SONAR_VAULT_PATH="$VAULT_PATH" \
+    SONAR_OLLAMA_URL="$OLLAMA_URL" \
     PYTHONUNBUFFERED=1 \
     uv run voice_loop.py
 }
@@ -391,6 +393,8 @@ cmd_exec_voice() {
   cd "$REPO_ROOT/voice" && exec env \
     SONAR_HARNESS_URL="http://127.0.0.1:${HARNESS_PORT}" \
     SONAR_GLOW_PORT="$GLOW_PORT" \
+    SONAR_VAULT_PATH="$VAULT_PATH" \
+    SONAR_OLLAMA_URL="$OLLAMA_URL" \
     PYTHONUNBUFFERED=1 \
     uv run voice_loop.py
 }

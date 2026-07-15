@@ -13,6 +13,7 @@
 #   "sounddevice>=0.4",        # mic in + speaker out (not in osvoice pyproject)
 #   "websockets>=13",
 #   "httpx>=0.27",
+#   "speechbrain>=1.0",        # ECAPA speaker embeddings for notes diarization
 # ]
 # ///
 """Sonar voice loop (I0) — press F5, speak, hear a vault-grounded answer.
@@ -76,12 +77,20 @@ from echo_gate import EchoGate  # noqa: E402
 from acks import next_ack  # noqa: E402
 from harness_client import DELTA, STEP, stream_turn  # noqa: E402
 from history import append_turn  # noqa: E402
+from notes import session as notes_session  # noqa: E402
+from notes.controller import NotesController  # noqa: E402
+from notes.intent import notes_title_hint, wants_notes_start  # noqa: E402
 
 log = logging.getLogger("sonar.voice")
 
 HOST = os.environ.get("SONAR_GLOW_HOST", "127.0.0.1")
 PORT = int(os.environ.get("SONAR_GLOW_PORT", "8770"))
 HARNESS_URL = os.environ.get("SONAR_HARNESS_URL", "http://127.0.0.1:8787").rstrip("/")
+OLLAMA_URL = os.environ.get("SONAR_OLLAMA_URL", "http://127.0.0.1:11434")
+VAULT_PATH = os.environ.get(
+    "SONAR_VAULT_PATH", os.path.expanduser("~/Documents/Obsidian Vault")
+)
+NOTES_PORT = int(os.environ.get("SONAR_NOTES_PORT", "8771"))
 
 SAMPLE_RATE = 16_000
 FRAME = 512                          # Silero window @16 kHz (32 ms)
@@ -131,6 +140,8 @@ class VoiceLoop:
         self.history: list[dict[str, str]] = []  # session memory (bounded)
         self._ack_rng = random.Random()          # rotate acks; avoid back-to-back repeats
         self._last_ack: str | None = None
+        self.notes: NotesController | None = None  # built in load()
+        self._notes_ws: Any | None = None          # overlay conn that started notes
 
     async def load(self) -> None:
         print("[voice] loading parakeet STT (first run downloads ~1-2GB)…", flush=True)
@@ -151,12 +162,21 @@ class VoiceLoop:
         import httpx
 
         self.harness = httpx.AsyncClient(base_url=HARNESS_URL)
+        self.notes = NotesController(
+            transcribe=self._transcribe_pcm,
+            vault_path=VAULT_PATH,
+            ollama_url=OLLAMA_URL,
+            port=NOTES_PORT,
+            on_ended=self._on_notes_done,
+        )
         print(f"[voice] ready — harness {HARNESS_URL}", flush=True)
 
     async def aclose(self) -> None:
         await self._cancel_response()
         self.stop_mic()
         self.player.stop()
+        if self.notes is not None:
+            await self.notes.aclose()
         if self.harness is not None:
             await self.harness.aclose()
 
@@ -212,6 +232,8 @@ class VoiceLoop:
                     # typed path so its 'text' isn't treated as a question.
                     self._start_say(ws, text.strip())
                 elif isinstance(text, str) and text.strip():
+                    if self._maybe_start_notes(ws, text.strip()):
+                        continue  # typed "take notes" starts a session, not a turn
                     self._start_response(ws, text.strip())  # typed -> harness + TTS
                 elif cmd == "start":
                     self.listening = True
@@ -223,15 +245,19 @@ class VoiceLoop:
                     # Second F5 / overlay close: stop EVERYTHING now — mic off,
                     # turn cancelled, and any audio still queued is flushed so the
                     # reply doesn't keep playing after you've dismissed it.
+                    # EXCEPT the mic while a notes session records: closing the
+                    # overlay must not kill an in-flight meeting transcript.
                     self.listening = False
-                    self.stop_mic()
+                    if not self._notes_recording():
+                        self.stop_mic()
                     await self._silence()
                     await self._send(ws, {"state": "idle", "level": 0.0})
                     print("[voice] stopped", flush=True)
         finally:
             consumer.cancel()
             self.listening = False
-            self.stop_mic()
+            if not self._notes_recording():
+                self.stop_mic()
             await self._silence()  # dropped socket: don't keep talking to a gone overlay
 
     async def _consume(self, ws) -> None:
@@ -243,7 +269,8 @@ class VoiceLoop:
         ticks = 0
         since_partial = 0
         while True:
-            if not self.listening or self.frames is None:
+            notes_live = self._notes_recording()
+            if (not self.listening and not notes_live) or self.frames is None:
                 capturing = False
                 utterance.clear()
                 preroll.clear()
@@ -260,6 +287,17 @@ class VoiceLoop:
                 ticks += 1
                 vad = self._silero_prob(frame)
                 level = rms_pcm16(frame)
+
+                if notes_live:
+                    # Notes mode owns the mic: frames feed the diarized
+                    # transcript, not the assistant. Keep the glow breathing;
+                    # keep the assistant's own capture state clean for later.
+                    capturing = False
+                    utterance = []
+                    self.notes.feed(frame, vad)
+                    if ticks % 3 == 0:
+                        await self._send(ws, {"state": "listening", "level": level})
+                    continue
 
                 if self.speaking:
                     if await self._barge_check(ws, vad, level, preroll):
@@ -295,7 +333,7 @@ class VoiceLoop:
                     capturing = False
                     turn, utterance = utterance, []
                     text = await self._emit_transcript(ws, turn, final=True)
-                    if text.strip():
+                    if text.strip() and not self._maybe_start_notes(ws, text.strip()):
                         self._start_response(ws, text.strip())
 
     async def _barge_check(
@@ -327,6 +365,60 @@ class VoiceLoop:
             self.silero.reset_states()
         await self._send(ws, {"answer": "", "partial": False})
         await self._send(ws, {"state": "listening", "level": 0.2})
+
+    # ---- notes mode (diarized note taker; see notes/) ----
+    def _notes_recording(self) -> bool:
+        """True while a notes session exists and hasn't been ended."""
+        return self.notes is not None and self.notes.recording
+
+    def _maybe_start_notes(self, ws, text: str) -> bool:
+        """Start a notes session iff ``text`` is the 'take notes' command."""
+        if self.notes is None or self._notes_recording() or not wants_notes_start(text):
+            return False
+        if self._response_task is not None and not self._response_task.done():
+            self._response_task.cancel()
+        self._response_task = asyncio.create_task(self._start_notes(ws, text))
+        return True
+
+    async def _start_notes(self, ws, trigger_text: str) -> None:
+        """Bring up the notes UI, say so, then open the mic tap.
+
+        Ordering matters: capture begins only AFTER the spoken ack has fully
+        played, so Sonar's own voice can never leak into the transcript as a
+        phantom speaker.
+        """
+        self._notes_ws = ws
+        try:
+            url = await self.notes.start(title_hint=notes_title_hint(trigger_text))
+            print(f"[voice] notes session — UI at {url}", flush=True)
+            await self._speak_text(
+                ws, "Taking notes. The notes window is up — say stop taking notes when you're done."
+            )
+            self.start_mic()  # normally already hot; harmless if so
+            self.notes.begin_capture()
+        except asyncio.CancelledError:
+            # F5 cutoff mid-startup: don't leave a half-open session behind.
+            with contextlib.suppress(Exception):
+                await self.notes.discard()
+            raise
+        except Exception as exc:  # noqa: BLE001 — a failed launch must say so
+            log.exception("notes session failed to start")
+            with contextlib.suppress(Exception):
+                await self.notes.discard()
+            await self._speak_text(ws, f"Sorry, I couldn't open the notes window. {exc}")
+
+    async def _on_notes_done(self) -> None:
+        """Notes session left recording (ended or discarded): hand the mic back."""
+        if not self.listening:
+            self.stop_mic()  # overlay is closed; don't leave the mic hot
+        self.endpointer.reset()
+        if self.silero is not None:
+            self.silero.reset_states()
+        state = self.notes.state if self.notes is not None else None
+        if state is not None and state.status == notes_session.REVIEW:
+            self._start_say(
+                self._notes_ws, "Done taking notes. Review and save them in the notes window."
+            )
 
     # ---- response: harness turn -> box + TTS ----
     def _start_response(self, ws, text: str) -> None:
