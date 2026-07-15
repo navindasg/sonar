@@ -77,6 +77,7 @@ class NotesController:
         self.state: sess.SessionState | None = None
         self._feeding = False
         self._ending = False
+        self._on_ended_fired = False
         self._save_path: Path | None = None
         self._registry = SpeakerRegistry(threshold=self._threshold)
         self._endpointer = Endpointer(silence_ms=self._silence_ms)
@@ -101,13 +102,27 @@ class NotesController:
         """True while mic frames should be routed to the notes pipeline."""
         return self._feeding
 
+    @property
+    def active(self) -> bool:
+        """True while a notes session owns the mic — RECORDING or SUMMARIZING.
+
+        The voice loop keeps mic frames out of the assistant path until the
+        session is handed back (on_ended, at REVIEW/DISCARDED): during the
+        summarize gap the mic is still hot but must not spawn a harness turn.
+        """
+        return self.state is not None and self.state.status in (
+            sess.RECORDING, sess.SUMMARIZING
+        )
+
     async def start(self, title_hint: str | None = None, now: datetime | None = None) -> str:
         """Prepare a fresh session (feeding stays OFF; see begin_capture)."""
         now = now or datetime.now()
         title = title_hint or f"Notes {now.strftime('%Y-%m-%d %H-%M')}"
         self.state = sess.SessionState(title=title, started_at=now.isoformat(timespec="seconds"))
         self._save_path = None
+        self._feeding = False
         self._ending = False
+        self._on_ended_fired = False
         self._registry = SpeakerRegistry(threshold=self._threshold)
         self._endpointer = Endpointer(silence_ms=self._silence_ms)
         self._preroll.clear()
@@ -115,9 +130,14 @@ class NotesController:
         self._capturing = False
         self._since_partial = 0
         self._frames_fed = 0
+        # This controller is long-lived and reused for every "take notes". A
+        # worker from a prior session is still parked on the OLD queue's
+        # `await get()`; cancel and await it BEFORE rebinding, then start a fresh
+        # worker on the new queue — otherwise session 2's feed() enqueues to a
+        # queue nothing consumes and end()'s queue.join() would hang forever.
+        await self._stop_worker()
         self._queue = asyncio.Queue()
-        if self._worker is None or self._worker.done():
-            self._worker = asyncio.create_task(self._work())
+        self._worker = asyncio.create_task(self._work())
 
         await self.server.start()
         self._launch_browser()
@@ -127,8 +147,20 @@ class NotesController:
         except Exception as exc:  # noqa: BLE001 — notes still work, single-speaker
             log.warning("speaker embedder unavailable (%s) — diarization disabled", exc)
             self._embed_ok = False
+        if not self._embed_ok:
+            # Surface the one-speaker degradation to the UI (see the shared
+            # `diarization_degraded` flag) instead of failing silently.
+            self.state = sess.set_diarization_degraded(self.state, True)
         await self._broadcast_state()
         return self.server.url
+
+    async def _stop_worker(self) -> None:
+        """Cancel and await the utterance worker (idempotent)."""
+        if self._worker is not None:
+            self._worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._worker
+            self._worker = None
 
     def begin_capture(self) -> None:
         """Open the mic tap (called after the spoken ack has fully played)."""
@@ -177,7 +209,11 @@ class NotesController:
         self._partial_task = asyncio.create_task(self._emit_partial(pcm))
 
     async def _emit_partial(self, pcm: bytes) -> None:
-        text = await self._transcribe(pcm)
+        try:
+            text = await self._transcribe(pcm)
+        except Exception as exc:  # noqa: BLE001 — partials are throwaway; the final utterance toasts on real failure
+            log.debug("notes partial transcription failed: %s", exc)
+            return
         if text.strip() and self._feeding:
             await self.server.broadcast({"type": "partial", "text": text})
 
@@ -200,7 +236,17 @@ class NotesController:
     async def _handle_utterance(self, pcm: bytes, t0: float, t1: float) -> None:
         if self.state is None or self.state.status != sess.RECORDING:
             return
-        text = await self._transcribe(pcm)
+        try:
+            text = await self._transcribe(pcm)
+        except Exception as exc:  # noqa: BLE001 — a failed STT must not silently drop a line
+            # This utterance had real audio (it cleared the min-frames gate), so
+            # an exception here means transcription FAILED, not that the room was
+            # quiet — say so rather than dropping the line invisibly.
+            log.warning("notes transcription failed: %s", exc)
+            await self.server.broadcast(
+                {"type": "error", "message": "a line couldn't be transcribed"}
+            )
+            return
         if not text.strip():
             return
         if wants_notes_stop(text):
@@ -224,15 +270,32 @@ class NotesController:
         # Drain BEFORE flipping status: queued utterances only land while the
         # session still reads as recording (see _handle_utterance's guard).
         await self._queue.join()
+        # A Discard can land during the drain — the status still reads RECORDING
+        # so the UI still offered it. That terminal state wins; don't resurrect
+        # a discarded session into SUMMARIZING/REVIEW.
+        if self.state.status != sess.RECORDING:
+            self._ending = False
+            return
         self.state = sess.set_status(self.state, sess.SUMMARIZING)
         await self._broadcast_state()
         summary = await self._summarize()
+        # Discard can also land while we awaited the (slow) summary; re-check
+        # before forcing REVIEW so a DISCARDED session is never clobbered.
+        if self.state.status != sess.SUMMARIZING:
+            self._ending = False
+            return
         self.state = sess.set_status(sess.set_summary(self.state, summary), sess.REVIEW)
         self._ending = False
         await self._broadcast_state()
-        if self.on_ended is not None:
-            with contextlib.suppress(Exception):
-                await self.on_ended()
+        await self._fire_on_ended()
+
+    async def _fire_on_ended(self) -> None:
+        """Hand the mic back to the voice loop — at most once per session exit."""
+        if self._on_ended_fired or self.on_ended is None:
+            return
+        self._on_ended_fired = True
+        with contextlib.suppress(Exception):
+            await self.on_ended()
 
     async def _summarize(self) -> str:
         import httpx
@@ -257,23 +320,27 @@ class NotesController:
         await self._broadcast_state()
 
     async def discard(self) -> None:
-        was_recording = self.recording
+        if self.state is None or self.state.status == sess.DISCARDED:
+            return
+        # on_ended matters whenever we leave an ACTIVE session (recording, or
+        # racing end() through its drain/summary): that's when the voice loop
+        # still needs the mic back. From REVIEW/SAVED the mic was already handed
+        # back, so the once-guard in _fire_on_ended makes that a harmless no-op.
+        was_active = self.state.status in (sess.RECORDING, sess.SUMMARIZING)
         self._feeding = False
         self._cancel_partial()
-        if self.state is not None:
-            self.state = sess.set_status(self.state, sess.DISCARDED)
-            await self._broadcast_state()
-        if was_recording and self.on_ended is not None:
-            # The voice loop reclaims the mic on any exit from recording.
-            with contextlib.suppress(Exception):
-                await self.on_ended()
+        self.state = sess.set_status(self.state, sess.DISCARDED)
+        await self._broadcast_state()
+        if was_active:
+            await self._fire_on_ended()
 
     # ---- server-facing (NotesOps) ---------------------------------------
     def state_json(self) -> dict:
         if self.state is None:
             return {"type": "state", "status": "idle", "rev": -1,
                     "segments": [], "speakers": [], "summary": "", "title": "",
-                    "saved_path": "", "elapsed_s": 0.0, "started_at": ""}
+                    "saved_path": "", "elapsed_s": 0.0, "started_at": "",
+                    "diarization_degraded": False}
         return sess.to_json(self.state, elapsed_s=self._frames_fed * _FRAME_S)
 
     async def apply_client_op(self, msg: dict) -> None:
@@ -312,19 +379,31 @@ class NotesController:
         await self.server.broadcast(self.state_json())
 
     def _launch_browser(self) -> None:
-        if not self._open_browser or os.environ.get("SONAR_NOTES_OPEN", "1") == "0":
+        if not self._open_browser:
             return
-        if sys.platform != "darwin":
+        url = self.server.url
+        # Record the URL somewhere durable BEFORE trying to open a tab: `open`
+        # is best-effort (suppressed) and a daemon's stdout is easily lost, so a
+        # failed open would otherwise strand a captured meeting with no way to
+        # reach Save (which lives only in the browser page).
+        self._publish_url(url)
+        if os.environ.get("SONAR_NOTES_OPEN", "1") == "0" or sys.platform != "darwin":
             return
         with contextlib.suppress(Exception):
-            subprocess.Popen(["open", self.server.url])
+            subprocess.Popen(["open", url])
+
+    def _publish_url(self, url: str) -> None:
+        """Write the notes UI URL to a stable file and log it prominently, so a
+        user can always reach the page even when no browser tab appears."""
+        log.info("notes UI ready — open %s to review and save", url)
+        home = Path(os.environ.get("SONAR_HOME", os.path.expanduser("~/.sonar")))
+        with contextlib.suppress(OSError):
+            run_dir = home / "run"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "notes.url").write_text(url + "\n", encoding="utf-8")
 
     async def aclose(self) -> None:
         self._feeding = False
         self._cancel_partial()
-        if self._worker is not None:
-            self._worker.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._worker
-            self._worker = None
+        await self._stop_worker()
         await self.server.stop()

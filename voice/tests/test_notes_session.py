@@ -95,3 +95,39 @@ def test_to_json_shape() -> None:
                              {"id": "S2", "name": "Speaker 2"}]
     assert j["segments"][0] == {"id": 0, "speaker": "S1",
                                 "text": "morning everyone", "t0": 0.0, "t1": 1.4}
+
+
+def test_to_json_carries_diarization_degraded_flag() -> None:
+    # SHARED CONTRACT: the key exists (default False) and reflects the field.
+    s = _base()
+    assert sess.to_json(s)["diarization_degraded"] is False
+    degraded = sess.set_diarization_degraded(s, True)
+    assert sess.to_json(degraded)["diarization_degraded"] is True
+    # idempotent: setting the same value returns the SAME object (no rev bump)
+    assert sess.set_diarization_degraded(degraded, True) is degraded
+
+
+def test_segment_ids_are_monotonic_across_deletes() -> None:
+    # #5 regression: ids come from a monotonic counter, not len(segments). A
+    # delete must never free an id for the next segment to reuse, or an
+    # id-keyed edit/delete would hit two rows at once.
+    s = _base()
+    s = sess.add_segment(s, "S1", "one", 0.0, 1.0)
+    s = sess.add_segment(s, "S1", "two", 1.0, 2.0)
+    s = sess.add_segment(s, "S1", "three", 2.0, 3.0)
+    assert [x.id for x in s.segments] == [0, 1, 2]
+
+    s = sess.delete_segment(s, 1)                 # drop the middle line
+    assert [x.id for x in s.segments] == [0, 2]
+
+    s = sess.add_segment(s, "S1", "four", 3.0, 4.0)
+    ids = [x.id for x in s.segments]
+    assert ids == [0, 2, 3]                       # the freed id 1 is NOT reused
+    assert len(ids) == len(set(ids))              # all ids unique
+
+    # an id-keyed op touches exactly one segment
+    edited = sess.edit_segment_text(s, 2, "EDITED")
+    touched = [x.id for x in edited.segments if x.text == "EDITED"]
+    assert touched == [2]
+    deleted = sess.delete_segment(s, 3)
+    assert [x.id for x in deleted.segments] == [0, 2]

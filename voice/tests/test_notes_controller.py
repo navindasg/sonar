@@ -195,3 +195,114 @@ async def test_feed_before_begin_capture_is_ignored(tmp_path: Path) -> None:
         assert not ctl.wants_frames
     finally:
         await ctl.aclose()
+
+
+# --- regression: #1 restart, #10 discard/end race, #15 degradation ---------
+
+
+class RaisingEmbedder:
+    """An embedder whose backend never loads (no Metal / speechbrain)."""
+
+    async def load(self) -> None:
+        raise RuntimeError("embedder backend unavailable")
+
+    async def embed(self, _pcm: bytes) -> np.ndarray | None:  # pragma: no cover
+        return None
+
+
+async def test_second_session_records_and_ends_without_deadlock(tmp_path: Path) -> None:
+    # #1 regression: the controller is long-lived and reused for every "take
+    # notes". A worker parked on the FIRST session's queue used to leak, so
+    # session 2's feed() enqueued to a queue nothing consumed and end()'s
+    # queue.join() hung forever. A fresh worker must consume the new queue.
+    stt, emb = FakeStt(), FakeEmbedder()
+    ctl = NotesController(
+        transcribe=stt, vault_path=tmp_path, embedder=emb,
+        open_browser=False, port=0,
+    )
+    ctl._summarize = _fake_summarize
+    try:
+        # session 1
+        await ctl.start(now=datetime(2026, 7, 15, 9, 0))
+        ctl.begin_capture()
+        stt.queue = ["first session line"]
+        emb.queue = [np.array([1.0, 0.0])]
+        _speak(ctl)
+        await _drain(ctl)
+        await ctl.end()
+        assert ctl.state.status == sess.REVIEW
+
+        # session 2 on the SAME controller
+        await ctl.start(now=datetime(2026, 7, 15, 10, 0))
+        ctl.begin_capture()
+        stt.queue = ["second session line"]
+        emb.queue = [np.array([1.0, 0.0])]
+        _speak(ctl)
+        await _drain(ctl)
+        assert [s.text for s in ctl.state.segments] == ["second session line"]
+
+        # end() must not deadlock on the drained queue.join()
+        await asyncio.wait_for(ctl.end(), timeout=3.0)
+        assert ctl.state.status == sess.REVIEW
+    finally:
+        await ctl.aclose()
+
+
+async def test_discard_during_summary_wins_and_fires_on_ended_once(tmp_path: Path) -> None:
+    # #10 regression: a Discard landing while end() awaits the (slow) AI overview
+    # must win — the terminal DISCARDED state is never clobbered back to REVIEW —
+    # and on_ended must fire exactly once across the interleaved end()/discard().
+    fired = {"n": 0}
+
+    async def on_ended() -> None:
+        fired["n"] += 1
+
+    stt, emb = FakeStt(), FakeEmbedder()
+    ctl = NotesController(
+        transcribe=stt, vault_path=tmp_path, embedder=emb,
+        open_browser=False, port=0, on_ended=on_ended,
+    )
+    gate = asyncio.Event()
+
+    async def slow_summarize() -> str:
+        await gate.wait()        # park end() inside the summary await
+        return "### Summary"
+
+    ctl._summarize = slow_summarize
+    try:
+        await ctl.start(now=datetime(2026, 7, 15, 9, 0))
+        ctl.begin_capture()
+        stt.queue = ["a real line"]
+        emb.queue = [np.array([1.0, 0.0])]
+        _speak(ctl)
+        await _drain(ctl)
+
+        end_task = asyncio.create_task(ctl.end())
+        await _until(lambda: ctl.state.status == sess.SUMMARIZING)
+
+        await ctl.discard()                    # discard lands mid-summary
+        assert ctl.state.status == sess.DISCARDED
+
+        gate.set()                             # let the slow summary return
+        await asyncio.wait_for(end_task, timeout=3.0)
+
+        assert ctl.state.status == sess.DISCARDED   # end() did not clobber it
+        assert fired["n"] == 1                       # on_ended fired exactly once
+    finally:
+        await ctl.aclose()
+
+
+async def test_embedder_load_failure_sets_diarization_degraded(tmp_path: Path) -> None:
+    # #15 regression: when the speaker embedder can't load, the session degrades
+    # to a single speaker — surface that through the SHARED CONTRACT flag instead
+    # of failing silently, so the UI can warn the user.
+    ctl = NotesController(
+        transcribe=FakeStt(), vault_path=tmp_path, embedder=RaisingEmbedder(),
+        open_browser=False, port=0,
+    )
+    ctl._summarize = _fake_summarize
+    try:
+        await ctl.start(now=datetime(2026, 7, 15, 9, 0))
+        assert ctl.state_json()["diarization_degraded"] is True
+    finally:
+        await ctl.aclose()

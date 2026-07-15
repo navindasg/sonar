@@ -163,7 +163,10 @@ class VoiceLoop:
 
         self.harness = httpx.AsyncClient(base_url=HARNESS_URL)
         self.notes = NotesController(
-            transcribe=self._transcribe_pcm,
+            # The notes path gets the RAISING variant so a real STT failure can
+            # surface as a toast instead of looking like silence (the assistant
+            # path keeps _transcribe_pcm, which drops a bad utterance).
+            transcribe=self._stt_text,
             vault_path=VAULT_PATH,
             ollama_url=OLLAMA_URL,
             port=NOTES_PORT,
@@ -230,10 +233,21 @@ class VoiceLoop:
                     # Proactive push (e.g. the scheduled morning brief): speak the
                     # given text directly — NO harness turn. Checked before the
                     # typed path so its 'text' isn't treated as a question.
+                    if self._notes_recording():
+                        # Never play TTS into a live meeting — the hot mic would
+                        # transcribe it as a phantom speaker. Drop the push.
+                        log.info("suppressing proactive say during a notes session")
+                        continue
                     self._start_say(ws, text.strip())
                 elif isinstance(text, str) and text.strip():
                     if self._maybe_start_notes(ws, text.strip()):
                         continue  # typed "take notes" starts a session, not a turn
+                    if self._notes_recording():
+                        # A live meeting owns the audio; a harness turn here would
+                        # speak TTS into it. Drop the typed turn (End from the
+                        # notes page when the meeting's done).
+                        log.info("suppressing typed turn during a notes session")
+                        continue
                     self._start_response(ws, text.strip())  # typed -> harness + TTS
                 elif cmd == "start":
                     self.listening = True
@@ -256,8 +270,14 @@ class VoiceLoop:
         finally:
             consumer.cancel()
             self.listening = False
-            if not self._notes_recording():
-                self.stop_mic()
+            # Tearing the connection down cancels _consume — the ONLY thing
+            # draining self.frames. Leaving the mic hot now (even to protect a
+            # live notes session) just fills the queue unbounded and freezes the
+            # transcript, so ALWAYS stop it. The notes page is a separate tab
+            # that stays up, so the user can still End from there.
+            if self._notes_recording():
+                log.warning("overlay disconnected mid-notes — stopping the now-consumerless mic (End from the notes page)")
+            self.stop_mic()
             await self._silence()  # dropped socket: don't keep talking to a gone overlay
 
     async def _consume(self, ws) -> None:
@@ -270,7 +290,11 @@ class VoiceLoop:
         since_partial = 0
         while True:
             notes_live = self._notes_recording()
-            if (not self.listening and not notes_live) or self.frames is None:
+            notes_active = self._notes_active()
+            # Stay in the loop through the summarize gap too (notes_active), so
+            # the mic is drained (frames dropped) instead of piling up unconsumed
+            # while the overlay is closed and end() awaits the AI overview.
+            if (not self.listening and not notes_active) or self.frames is None:
                 capturing = False
                 utterance.clear()
                 preroll.clear()
@@ -288,13 +312,19 @@ class VoiceLoop:
                 vad = self._silero_prob(frame)
                 level = rms_pcm16(frame)
 
-                if notes_live:
-                    # Notes mode owns the mic: frames feed the diarized
-                    # transcript, not the assistant. Keep the glow breathing;
-                    # keep the assistant's own capture state clean for later.
+                if notes_active:
+                    # Notes owns the mic: frames feed the diarized transcript,
+                    # never the assistant. Keep the assistant's capture state
+                    # clean and the glow breathing. Two guards on the actual feed:
+                    #  - not while SUMMARIZING (notes_live is False then): the mic
+                    #    is still hot but the session is closing — just drop, so a
+                    #    stray utterance can't leak into the assistant path.
+                    #  - not while Sonar is speaking: TTS bleeding into a hot mic
+                    #    would be transcribed as a phantom speaker.
                     capturing = False
                     utterance = []
-                    self.notes.feed(frame, vad)
+                    if notes_live and not self.speaking:
+                        self.notes.feed(frame, vad)
                     if ticks % 3 == 0:
                         await self._send(ws, {"state": "listening", "level": level})
                     continue
@@ -370,6 +400,15 @@ class VoiceLoop:
     def _notes_recording(self) -> bool:
         """True while a notes session exists and hasn't been ended."""
         return self.notes is not None and self.notes.recording
+
+    def _notes_active(self) -> bool:
+        """True while a notes session owns the mic — recording OR summarizing.
+
+        Broader than _notes_recording: after end() flips to SUMMARIZING the mic
+        is still hot, and its frames must be kept out of the assistant path (a
+        spurious harness turn) until on_ended hands the mic back.
+        """
+        return self.notes is not None and self.notes.active
 
     def _maybe_start_notes(self, ws, text: str) -> bool:
         """Start a notes session iff ``text`` is the 'take notes' command."""
@@ -591,18 +630,30 @@ class VoiceLoop:
             await self._send(ws, {"transcript": text, "partial": not final})
         return text
 
-    async def _transcribe_pcm(self, pcm: bytes) -> str:
+    async def _stt_text(self, pcm: bytes) -> str:
+        """Transcribe one PCM16 buffer with Parakeet. RAISES on backend failure.
+
+        Feeds the WHOLE buffer as ONE chunk (a sub-window sliver underflows to a
+        2^64-4096 Metal alloc; one-shot on the full buffer is the model's own
+        warmup path — see stt_bridge.py). Callers pick their own failure policy:
+        the assistant path drops a bad utterance; the notes path toasts it.
+        """
         async def audio() -> AsyncIterator[bytes]:
             yield pcm
 
         text = ""
+        async for t in self.stt.stream(audio()):
+            if t.is_final:
+                text = t.text
+        return text
+
+    async def _transcribe_pcm(self, pcm: bytes) -> str:
+        """Assistant-path STT: a failed utterance is dropped, never fatal."""
         try:
-            async for t in self.stt.stream(audio()):
-                if t.is_final:
-                    text = t.text
+            return await self._stt_text(pcm)
         except Exception as exc:  # noqa: BLE001 — one bad utterance must not kill the loop
             print(f"[voice] transcription error: {exc}", flush=True)
-        return text
+            return ""
 
     async def _send(self, ws, msg: dict) -> None:
         """Best-effort JSON send; a dropped socket ends the connection loop, not us."""

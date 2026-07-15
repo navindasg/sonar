@@ -51,6 +51,8 @@ class SessionState:
     summary_md: str = ""
     saved_path: str = ""                  # vault-relative once saved
     rev: int = 0
+    next_seg_id: int = 0                   # monotonic; segment ids never reused
+    diarization_degraded: bool = False    # embedder unavailable -> one speaker
 
 
 def default_name(speaker: str) -> str:
@@ -80,9 +82,13 @@ def add_segment(
     if not _SPEAKER_ID.match(speaker) or not text.strip():
         return state
     state = _ensure_speaker(state, speaker)
-    seg = Segment(id=len(state.segments), speaker=speaker,
+    # Ids come from a monotonic counter, not len(segments): after a delete the
+    # latter would hand a live id to the next segment, so every id-keyed op and
+    # the UI's row keys would then hit two rows at once.
+    seg = Segment(id=state.next_seg_id, speaker=speaker,
                   text=text.strip()[:_MAX_TEXT], t0=round(t0, 2), t1=round(t1, 2))
-    return _bump(state, segments=state.segments + (seg,))
+    return _bump(state, segments=state.segments + (seg,),
+                 next_seg_id=state.next_seg_id + 1)
 
 
 def edit_segment_text(state: SessionState, seg_id: object, text: object) -> SessionState:
@@ -160,6 +166,14 @@ def mark_saved(state: SessionState, rel_path: str) -> SessionState:
     return _bump(state, status=SAVED, saved_path=rel_path)
 
 
+def set_diarization_degraded(state: SessionState, degraded: bool) -> SessionState:
+    """Flag that speaker diarization is unavailable (the embedder failed to load),
+    so the UI can warn that everyone lands under one speaker. Idempotent."""
+    if not isinstance(degraded, bool) or state.diarization_degraded == degraded:
+        return state
+    return _bump(state, diarization_degraded=degraded)
+
+
 def to_json(state: SessionState, elapsed_s: float = 0.0) -> dict:
     """One full-state message for the UI (server stamps live elapsed time)."""
     return {
@@ -176,4 +190,5 @@ def to_json(state: SessionState, elapsed_s: float = 0.0) -> dict:
         ],
         "summary": state.summary_md,
         "saved_path": state.saved_path,
+        "diarization_degraded": state.diarization_degraded,
     }
