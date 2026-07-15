@@ -79,3 +79,25 @@ def test_centroid_tracks_the_running_mean() -> None:
 def test_bad_config_rejected(kwargs: dict) -> None:
     with pytest.raises(ValueError):
         SpeakerRegistry(**kwargs)
+
+
+def test_none_first_then_real_embedding_does_not_crash_or_drop() -> None:
+    # #6 regression: a first None (embedder not ready) used to plant a 1-D zero
+    # placeholder centroid; the next REAL 192-D embedding's np.dot against it
+    # would raise a shape error and that segment would be dropped. The None turn
+    # must fall back to S1 WITHOUT seeding a bogus centroid, so the following
+    # real embedding creates the genuine first centroid and is never lost.
+    rng = np.random.default_rng(0)
+    v1 = rng.standard_normal(192).astype(np.float32)
+    v1_ish = (v1 + 0.01 * rng.standard_normal(192).astype(np.float32)).astype(np.float32)
+    v2 = rng.standard_normal(192).astype(np.float32)   # a clearly different voice
+
+    reg = SpeakerRegistry()
+    a0 = reg.assign(None, duration_s=2.0)              # embedder down for turn 0
+    a1 = reg.assign(v1, duration_s=2.0)                # first REAL embedding
+    a2 = reg.assign(v1_ish, duration_s=2.0)            # same voice
+    a3 = reg.assign(v2, duration_s=2.0)                # different voice
+
+    # every turn got a label — the real embedding after the None was NOT dropped
+    assert [a.speaker for a in (a0, a1, a2, a3)] == ["S1", "S1", "S1", "S2"]
+    assert reg.speakers == ["S1", "S2"]

@@ -114,6 +114,12 @@
     transition: opacity .25s; pointer-events: none; max-width: 80vw;
   }
   .hint { color: var(--dim); font-size: 12.5px; margin: 6px 2px 0; }
+  #degraded {
+    display: flex; align-items: center; gap: 8px; margin: 0 2px 14px;
+    padding: 8px 14px; border-radius: 10px; font-size: 13px;
+    background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  }
+  #degraded .dot { background: var(--s3); }
 </style>
 </head>
 <body>
@@ -124,6 +130,7 @@
     <span class="pill" id="clock">00:00</span>
   </header>
   <div id="speakers"></div>
+  <div id="degraded" class="hidden" role="status"><span class="dot"></span><span>Speaker separation is off — every line is one speaker.</span></div>
   <p class="hint" id="hintbar">Click a name to relabel a speaker · click the name on a line to move that line to the next speaker · click text to edit · ✕ deletes a line. Say “stop taking notes” or hit End.</p>
 
   <section id="summaryCard" class="hidden">
@@ -148,12 +155,24 @@
   const COLORS = ["--s1","--s2","--s3","--s4","--s5","--s6","--s7","--s8"];
   const $ = (id) => document.getElementById(id);
   let ws = null, state = null, timer = null, baseElapsed = 0, baseAt = Date.now();
-  const debouncers = new Map();
+  const debouncers = new Map();   // key -> {timer, fn}; fn re-reads the live DOM when it fires
+  let outbox = [];                // ops queued while the socket is down, replayed on reopen
 
-  function send(msg) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); }
+  function send(msg) {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
+    else outbox.push(msg);        // don't drop an edit made during the ~1.2s reconnect window
+  }
   function debounced(key, ms, fn) {
-    clearTimeout(debouncers.get(key));
-    debouncers.set(key, setTimeout(fn, ms));
+    const prev = debouncers.get(key);
+    if (prev) clearTimeout(prev.timer);
+    debouncers.set(key, {fn, timer: setTimeout(() => { debouncers.delete(key); fn(); }, ms)});
+  }
+  function flushPending() {
+    // Fire every outstanding debounced edit NOW (each fn re-reads the DOM), in insertion
+    // order, so a following save/end op reaches the server after the latest text.
+    const pending = [...debouncers.values()];
+    debouncers.clear();
+    for (const {timer, fn} of pending) { clearTimeout(timer); fn(); }
   }
   function toast(text) {
     const el = $("toast");
@@ -172,6 +191,8 @@
 
     renderStatus();
     renderSpeakers(editing);
+    // SHARED CONTRACT: warn when the speaker embedder failed and everyone is one voice.
+    $("degraded").classList.toggle("hidden", !state.diarization_degraded);
     renderTranscript(editing);
     renderSummary(editing);
     renderFooter();
@@ -227,41 +248,84 @@
 
   function renderTranscript(editing) {
     const box = $("transcript");
-    if (box.contains(editing)) return; // don't clobber an in-progress text edit
-    box.replaceChildren();
-    for (const seg of state.segments) {
-      const row = document.createElement("div");
-      row.className = "seg"; row.dataset.id = seg.id;
+    // Freeze ONLY the line whose text is being actively edited (to preserve its caret).
+    // Key on the editable `.txt`, not on "focus is anywhere in #transcript" — a focused
+    // reassign/✕ button must still let its own row (and every other row) re-render.
+    const frozenId = (editing && editing.classList && editing.classList.contains("txt"))
+      ? editing.closest(".seg").dataset.id : null;
+    // Capture scroll intent BEFORE mutating: only follow to the bottom if already near it.
+    const nearBottom = (window.scrollY + window.innerHeight) >= (document.body.scrollHeight - 120);
 
-      const who = document.createElement("div"); who.className = "who";
-      const btn = document.createElement("button");
-      btn.textContent = nameOf(seg.speaker);
-      btn.style.color = colorOf(seg.speaker);
-      btn.title = "Move this line to the next speaker";
-      btn.addEventListener("click", () => {
-        const ids = state.speakers.map(s => s.id);
-        const next = ids[(ids.indexOf(seg.speaker) + 1) % ids.length];
-        if (next && next !== seg.speaker) send({op: "reassign", id: seg.id, speaker: next});
-      });
-      const t = document.createElement("span");
-      t.className = "t"; t.textContent = mmss(seg.t0);
-      who.append(btn, t);
+    const existing = new Map();
+    for (const row of box.children) existing.set(row.dataset.id, row);
 
-      const txt = document.createElement("div");
-      txt.className = "txt"; txt.contentEditable = "plaintext-only";
-      txt.textContent = seg.text; txt.spellcheck = false;
-      txt.addEventListener("input", () =>
-        debounced(`s:${seg.id}`, 600, () => send({op: "edit_segment", id: seg.id, text: txt.textContent})));
-      txt.addEventListener("blur", () => send({op: "edit_segment", id: seg.id, text: txt.textContent}));
+    // Reconcile by segment id: reuse rows (updating in place), build missing ones, and
+    // leave the frozen row entirely untouched.
+    const desired = state.segments.map((seg) => {
+      const sid = String(seg.id);
+      const row = existing.get(sid);
+      if (row && sid === frozenId) return row;      // caret lives in this row — don't touch it
+      if (row) { updateSegRow(row, seg); return row; }
+      return buildSegRow(seg);
+    });
 
-      const del = document.createElement("button");
-      del.className = "del"; del.textContent = "✕"; del.title = "Delete this line";
-      del.addEventListener("click", () => send({op: "delete_segment", id: seg.id}));
+    const keep = new Set(desired);
+    for (const row of [...box.children]) if (!keep.has(row)) row.remove();
 
-      row.append(who, txt, del);
-      box.append(row);
+    // Order the rows with minimal moves (a row already in position is never touched).
+    let ref = box.firstChild;
+    for (const row of desired) {
+      if (row === ref) ref = ref.nextSibling;
+      else box.insertBefore(row, ref);
     }
-    if (state.status === "recording") window.scrollTo(0, document.body.scrollHeight);
+
+    if (state.status === "recording" && nearBottom) window.scrollTo(0, document.body.scrollHeight);
+  }
+
+  function buildSegRow(seg) {
+    const segId = seg.id;   // stable key; handlers re-read speaker/text from `state` at click time
+    const row = document.createElement("div");
+    row.className = "seg"; row.dataset.id = seg.id;
+
+    const who = document.createElement("div"); who.className = "who";
+    const btn = document.createElement("button");
+    btn.title = "Move this line to the next speaker";
+    btn.addEventListener("click", () => {
+      const cur = state.segments.find(s => s.id === segId);
+      if (!cur) return;
+      const ids = state.speakers.map(s => s.id);
+      const next = ids[(ids.indexOf(cur.speaker) + 1) % ids.length];
+      if (next && next !== cur.speaker) send({op: "reassign", id: segId, speaker: next});
+    });
+    const t = document.createElement("span"); t.className = "t";
+    who.append(btn, t);
+
+    const txt = document.createElement("div");
+    txt.className = "txt"; txt.contentEditable = "plaintext-only"; txt.spellcheck = false;
+    txt.addEventListener("input", () =>
+      debounced(`s:${segId}`, 600, () => send({op: "edit_segment", id: segId, text: txt.textContent})));
+    txt.addEventListener("blur", () => send({op: "edit_segment", id: segId, text: txt.textContent}));
+
+    const del = document.createElement("button");
+    del.className = "del"; del.textContent = "✕"; del.title = "Delete this line";
+    del.addEventListener("click", () => send({op: "delete_segment", id: segId}));
+
+    row.append(who, txt, del);
+    updateSegRow(row, seg);
+    return row;
+  }
+
+  function updateSegRow(row, seg) {
+    const btn = row.querySelector(".who button");
+    const name = nameOf(seg.speaker);
+    if (btn.textContent !== name) btn.textContent = name;
+    btn.style.color = colorOf(seg.speaker);
+    const t = row.querySelector(".t");
+    const ts = mmss(seg.t0);
+    if (t.textContent !== ts) t.textContent = ts;
+    const txt = row.querySelector(".txt");
+    // Never stomp a caret: refresh text only when this line isn't the one being typed in.
+    if (txt !== document.activeElement && txt.textContent !== seg.text) txt.textContent = seg.text;
   }
 
   function renderSummary(editing) {
@@ -289,14 +353,21 @@
     debounced("title", 500, () => send({op: "set_title", title: $("title").value})));
   $("summary").addEventListener("input", () =>
     debounced("summary", 600, () => send({op: "edit_summary", markdown: $("summary").value})));
-  $("endBtn").addEventListener("click", () => send({op: "end"}));
-  $("saveBtn").addEventListener("click", () => send({op: "save"}));
+  $("endBtn").addEventListener("click", () => { flushPending(); send({op: "end"}); });
+  $("saveBtn").addEventListener("click", () => { flushPending(); send({op: "save"}); });
   $("discardBtn").addEventListener("click", () => {
     if (window.confirm("Discard this whole session? The transcript will be lost.")) send({op: "discard"});
   });
 
   function connect() {
     ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.onopen = () => {
+      // Replay any edits that were queued while the socket was down. The reconnect
+      // snapshot may briefly show the older value, but these ops re-assert the newer one.
+      if (!outbox.length) return;
+      const pending = outbox; outbox = [];
+      for (const m of pending) send(m);
+    };
     ws.onmessage = (ev) => {
       let msg;
       try { msg = JSON.parse(ev.data); } catch { return; }

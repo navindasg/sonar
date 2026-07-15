@@ -100,10 +100,15 @@ class SpeakerRegistry:
         return Assignment(speaker=self._last, is_new=True, similarity=1.0)
 
     def _fallback(self, similarity: float = 0.0) -> Assignment:
-        """No usable embedding: current speaker, or S1 for the very first turn."""
+        """No usable embedding: current speaker, or S1 for the very first turn.
+
+        We deliberately do NOT seed a centroid here. A placeholder would have the
+        wrong dimensionality (we never saw a real embedding), and the next real
+        192-D embedding's cosine comparison against it would raise in np.dot and
+        drop that segment. Leaving _sums empty lets a later real embedding create
+        the first genuine centroid via assign()'s empty-registry path.
+        """
         if self._last is None:
-            self._sums.append(np.zeros(1, dtype=np.float32))
-            self._counts.append(1)
             self._last = "S1"
             return Assignment(speaker="S1", is_new=True, similarity=similarity)
         return Assignment(speaker=self._last, is_new=False, similarity=similarity)

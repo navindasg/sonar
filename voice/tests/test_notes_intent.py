@@ -74,3 +74,42 @@ def test_title_hint_extracted() -> None:
 def test_title_hint_absent() -> None:
     assert notes_title_hint("take notes") is None
     assert notes_title_hint("this is not a command") is None
+
+
+# --- regressions: whole-utterance anchoring (#8), tighter START (#17),
+#     broader lead-ins (#21) ---
+
+@pytest.mark.parametrize("text", [
+    # #17: a note phrase that runs on into non-title content is an aside, not a
+    # command, and must NOT start a session.
+    "so take notes of that everyone",
+    "ok let's take notes offline",
+])
+def test_start_no_longer_fires_on_asides(text: str) -> None:
+    assert not wants_notes_start(text)
+
+
+@pytest.mark.parametrize("text", [
+    # #21: common acknowledgments before a genuine command are now accepted.
+    "alright take notes",
+    "cool take notes",
+    "sure take notes",
+    "hey there take notes",
+])
+def test_start_fires_after_broadened_lead_ins(text: str) -> None:
+    assert wants_notes_start(text)
+
+
+def test_stop_no_longer_fires_on_run_on_sentence() -> None:
+    # #8: the core false-positive — a sentence that merely mentions notes and
+    # runs on into other content must not end the session.
+    assert not wants_notes_stop("so let's wrap up the notes and grab lunch")
+
+
+@pytest.mark.parametrize("text", [
+    # #21: acknowledgments before a genuine stop command are now accepted.
+    "alright, stop taking notes",
+    "great stop the notes",
+])
+def test_stop_fires_after_broadened_lead_ins(text: str) -> None:
+    assert wants_notes_stop(text)
