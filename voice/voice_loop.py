@@ -430,8 +430,11 @@ class VoiceLoop:
         try:
             url = await self.notes.start(title_hint=notes_title_hint(trigger_text))
             print(f"[voice] notes session — UI at {url}", flush=True)
+            # Don't tell the user to say a stop phrase: spoken stop is unreliable
+            # (STT rarely hears "stop taking notes" cleanly), so the notes window's
+            # End button is the real control. Just point them there.
             await self._speak_text(
-                ws, "Taking notes. The notes window is up — say stop taking notes when you're done."
+                ws, "Taking notes. Hit end in the notes window when you're done."
             )
             self.start_mic()  # normally already hot; harmless if so
             self.notes.begin_capture()

@@ -41,13 +41,26 @@
     border-radius: 999px; font-size: 13px; font-weight: 600; cursor: text;
     background: var(--panel); border: 1px solid var(--line);
   }
+  .chip { transition: border-color .15s; }
+  .chip:focus-within { border-color: var(--accent); }
   .chip .swatch { width: 9px; height: 9px; border-radius: 50%; }
   .chip input {
-    background: transparent; border: 0; color: inherit; font: inherit;
-    width: 9ch; outline: none;
+    background: transparent; border: 0; border-bottom: 1px dashed var(--line);
+    color: inherit; font: inherit; width: 9ch; outline: none; padding-bottom: 1px;
   }
+  .chip input::placeholder { color: var(--dim); }
+  .chip input:focus { border-bottom-color: var(--accent); }
   .chip.add { color: var(--dim); cursor: pointer; user-select: none; }
   .chip.add:hover { color: var(--text); }
+
+  /* Per-line "who said this" reassign dropdown — fix a mis-attributed line. */
+  .who select {
+    border: 0; background: transparent; font: 600 13px/1.3 inherit; cursor: pointer;
+    padding: 1px 4px; border-radius: 6px; max-width: 128px;
+    -webkit-appearance: none; appearance: none;
+  }
+  .who select:hover, .who select:focus { outline: 1px solid var(--line); }
+  .who select option { color: var(--text); background: var(--panel2); }
 
   #transcript { display: flex; flex-direction: column; gap: 2px; }
   .seg {
@@ -131,7 +144,7 @@
   </header>
   <div id="speakers"></div>
   <div id="degraded" class="hidden" role="status"><span class="dot"></span><span>Speaker separation is off — every line is one speaker.</span></div>
-  <p class="hint" id="hintbar">Click a name to relabel a speaker · click the name on a line to move that line to the next speaker · click text to edit · ✕ deletes a line. Say “stop taking notes” or hit End.</p>
+  <p class="hint" id="hintbar">Type a name in the chips above to label each speaker (Navin, Dad, …) · use a line's dropdown to fix who said it · click text to edit · ✕ deletes a line · hit End when you're done.</p>
 
   <section id="summaryCard" class="hidden">
     <h2 id="summaryHead">AI OVERVIEW</h2>
@@ -173,6 +186,12 @@
     const pending = [...debouncers.values()];
     debouncers.clear();
     for (const {timer, fn} of pending) { clearTimeout(timer); fn(); }
+  }
+  function flushKey(key) {
+    // Commit one pending debounced op immediately (e.g. a rename on blur), so a
+    // quick type-then-click-away can't drop the change before its timer fires.
+    const p = debouncers.get(key);
+    if (p) { clearTimeout(p.timer); debouncers.delete(key); p.fn(); }
   }
   function toast(text) {
     const el = $("toast");
@@ -228,12 +247,25 @@
       const inp = document.createElement("input");
       inp.value = sp.name; inp.spellcheck = false;
       inp.size = Math.max(6, sp.name.length);
-      inp.title = `Rename ${sp.id}`;
-      inp.addEventListener("focus", () => inp.select());  // typing replaces "Speaker N"
+      inp.title = `Type this speaker's name (e.g. Navin, Dad)`;
+      inp.placeholder = sp.id;
+      // Kill browser/password-manager autofill: a name-shaped field otherwise
+      // pops the saved-names dropdown and can drop a stray value into it (we saw
+      // a phantom "Bob" appear). The randomized name defeats Chrome's heuristic
+      // autofill, which ignores autocomplete="off" on fields it reads as names.
+      inp.setAttribute("autocomplete", "off");
+      inp.setAttribute("autocapitalize", "words");
+      inp.setAttribute("autocorrect", "off");
+      inp.setAttribute("data-1p-ignore", "");
+      inp.setAttribute("data-lpignore", "true");
+      inp.name = `sp-${sp.id}-${Math.random().toString(36).slice(2)}`;
+      const key = `n:${sp.id}`;
+      inp.addEventListener("focus", () => inp.select());  // typing replaces the current name
       inp.addEventListener("input", () => {
         inp.size = Math.max(6, inp.value.length);
-        debounced(`n:${sp.id}`, 500, () => send({op: "rename", speaker: sp.id, name: inp.value}));
+        debounced(key, 400, () => send({op: "rename", speaker: sp.id, name: inp.value}));
       });
+      inp.addEventListener("blur", () => flushKey(key));   // don't lose a quick rename+click-away
       inp.addEventListener("keydown", (e) => { if (e.key === "Enter") inp.blur(); });
       chip.append(sw, inp);
       box.append(chip);
@@ -288,17 +320,16 @@
     row.className = "seg"; row.dataset.id = seg.id;
 
     const who = document.createElement("div"); who.className = "who";
-    const btn = document.createElement("button");
-    btn.title = "Move this line to the next speaker";
-    btn.addEventListener("click", () => {
-      const cur = state.segments.find(s => s.id === segId);
-      if (!cur) return;
-      const ids = state.speakers.map(s => s.id);
-      const next = ids[(ids.indexOf(cur.speaker) + 1) % ids.length];
-      if (next && next !== cur.speaker) send({op: "reassign", id: segId, speaker: next});
+    // A dropdown, not a cycle button: with 3-4 people you want to jump straight
+    // to the right speaker to fix a mis-attributed line (the case diarization
+    // gets wrong on overlap), not click through everyone.
+    const sel = document.createElement("select");
+    sel.title = "Who said this — reassign the line";
+    sel.addEventListener("change", () => {
+      if (sel.value) send({op: "reassign", id: segId, speaker: sel.value});
     });
     const t = document.createElement("span"); t.className = "t";
-    who.append(btn, t);
+    who.append(sel, t);
 
     const txt = document.createElement("div");
     txt.className = "txt"; txt.contentEditable = "plaintext-only"; txt.spellcheck = false;
@@ -316,10 +347,20 @@
   }
 
   function updateSegRow(row, seg) {
-    const btn = row.querySelector(".who button");
-    const name = nameOf(seg.speaker);
-    if (btn.textContent !== name) btn.textContent = name;
-    btn.style.color = colorOf(seg.speaker);
+    const sel = row.querySelector(".who select");
+    // Rebuild the options only when the speaker set/names actually changed, so
+    // an open dropdown or the current selection isn't disrupted every render.
+    const sig = state.speakers.map(s => `${s.id}:${s.name}`).join("|");
+    if (sel.dataset.sig !== sig) {
+      sel.replaceChildren(...state.speakers.map(sp => {
+        const o = document.createElement("option");
+        o.value = sp.id; o.textContent = sp.name;
+        return o;
+      }));
+      sel.dataset.sig = sig;
+    }
+    if (sel.value !== seg.speaker) sel.value = seg.speaker;
+    sel.style.color = colorOf(seg.speaker);
     const t = row.querySelector(".t");
     const ts = mmss(seg.t0);
     if (t.textContent !== ts) t.textContent = ts;
