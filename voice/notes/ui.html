@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sonar Notes</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b24; --panel2: #1c2330; --line: #2a3342;
+    --text: #e6ebf2; --dim: #8b96a8; --accent: #5eead4; --danger: #f87171;
+    --s1: #60a5fa; --s2: #f472b6; --s3: #fbbf24; --s4: #34d399;
+    --s5: #a78bfa; --s6: #fb923c; --s7: #22d3ee; --s8: #f87171;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.55 -apple-system, "SF Pro Text", Helvetica, Arial, sans-serif;
+    display: flex; justify-content: center; min-height: 100vh;
+  }
+  main { width: min(860px, 96vw); padding: 28px 0 80px; }
+
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+  #title {
+    flex: 1; background: transparent; border: 0; color: var(--text);
+    font-size: 22px; font-weight: 650; padding: 6px 8px; border-radius: 8px;
+  }
+  #title:hover, #title:focus { background: var(--panel); outline: none; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px;
+    border-radius: 999px; background: var(--panel); border: 1px solid var(--line);
+    font-size: 13px; color: var(--dim); white-space: nowrap;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+  .rec .dot { background: #ef4444; animation: pulse 1.4s ease-in-out infinite; }
+  .rec { color: #fca5a5; }
+  @keyframes pulse { 50% { opacity: .35; } }
+
+  #speakers { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 18px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; padding: 4px 11px;
+    border-radius: 999px; font-size: 13px; font-weight: 600; cursor: text;
+    background: var(--panel); border: 1px solid var(--line);
+  }
+  .chip .swatch { width: 9px; height: 9px; border-radius: 50%; }
+  .chip input {
+    background: transparent; border: 0; color: inherit; font: inherit;
+    width: 9ch; outline: none;
+  }
+  .chip.add { color: var(--dim); cursor: pointer; user-select: none; }
+  .chip.add:hover { color: var(--text); }
+
+  #transcript { display: flex; flex-direction: column; gap: 2px; }
+  .seg {
+    display: grid; grid-template-columns: 140px 1fr auto; gap: 10px;
+    padding: 9px 10px; border-radius: 10px; align-items: baseline;
+  }
+  .seg:hover { background: var(--panel); }
+  .who { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; }
+  .who button {
+    border: 0; background: transparent; font: 600 13px/1.3 inherit;
+    cursor: pointer; padding: 1px 8px; border-radius: 999px;
+  }
+  .who button:hover { outline: 1px solid var(--line); }
+  .t { font-size: 11px; color: var(--dim); padding-left: 8px; }
+  .txt { outline: none; white-space: pre-wrap; }
+  .txt:focus { background: var(--panel2); border-radius: 6px; box-shadow: 0 0 0 6px var(--panel2); }
+  .del {
+    border: 0; background: transparent; color: transparent; cursor: pointer;
+    font-size: 14px; border-radius: 6px; padding: 0 6px;
+  }
+  .seg:hover .del { color: var(--dim); }
+  .del:hover { color: var(--danger); }
+
+  #partial { padding: 10px 10px 2px 160px; color: var(--dim); font-style: italic; min-height: 1.6em; }
+  #partial::after { content: "▍"; animation: pulse 1s infinite; }
+  #partial:empty::after { content: ""; }
+
+  #summaryCard {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 18px 20px; margin: 22px 0;
+  }
+  #summaryCard h2 { font-size: 15px; letter-spacing: .04em; color: var(--accent); margin-bottom: 10px; }
+  #summary {
+    width: 100%; min-height: 220px; resize: vertical; background: var(--panel2);
+    color: var(--text); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px; font: 13.5px/1.6 ui-monospace, "SF Mono", Menlo, monospace;
+    outline: none;
+  }
+  .spin {
+    width: 16px; height: 16px; border-radius: 50%; display: inline-block;
+    border: 2px solid var(--line); border-top-color: var(--accent);
+    animation: rot .8s linear infinite; vertical-align: -3px; margin-right: 8px;
+  }
+  @keyframes rot { to { transform: rotate(360deg); } }
+
+  footer {
+    position: fixed; bottom: 0; left: 0; right: 0; display: flex; gap: 10px;
+    justify-content: center; padding: 14px; background: linear-gradient(transparent, var(--bg) 40%);
+  }
+  button.big {
+    font: 600 14px/1 inherit; padding: 12px 26px; border-radius: 12px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--text);
+    cursor: pointer;
+  }
+  button.big:hover { background: var(--panel2); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #06281f; }
+  button.primary:hover { filter: brightness(1.1); background: var(--accent); }
+  button.danger:hover { color: var(--danger); border-color: var(--danger); }
+  .hidden { display: none !important; }
+  #toast {
+    position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+    background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+    padding: 9px 16px; border-radius: 10px; font-size: 13px; opacity: 0;
+    transition: opacity .25s; pointer-events: none; max-width: 80vw;
+  }
+  .hint { color: var(--dim); font-size: 12.5px; margin: 6px 2px 0; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <input id="title" spellcheck="false" aria-label="Session title">
+    <span class="pill" id="status"><span class="dot"></span><span id="statusText">connecting…</span></span>
+    <span class="pill" id="clock">00:00</span>
+  </header>
+  <div id="speakers"></div>
+  <p class="hint" id="hintbar">Click a name to relabel a speaker · click the name on a line to move that line to the next speaker · click text to edit · ✕ deletes a line. Say “stop taking notes” or hit End.</p>
+
+  <section id="summaryCard" class="hidden">
+    <h2 id="summaryHead">AI OVERVIEW</h2>
+    <textarea id="summary" spellcheck="false" aria-label="AI overview markdown"></textarea>
+  </section>
+
+  <section id="transcript" aria-live="polite"></section>
+  <div id="partial"></div>
+
+  <footer>
+    <button class="big danger" id="discardBtn" title="Throw the session away">Discard</button>
+    <button class="big primary" id="endBtn">■ End &amp; summarize</button>
+    <button class="big primary hidden" id="saveBtn">Save to vault</button>
+  </footer>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+(() => {
+  const COLORS = ["--s1","--s2","--s3","--s4","--s5","--s6","--s7","--s8"];
+  const $ = (id) => document.getElementById(id);
+  let ws = null, state = null, timer = null, baseElapsed = 0, baseAt = Date.now();
+  const debouncers = new Map();
+
+  function send(msg) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); }
+  function debounced(key, ms, fn) {
+    clearTimeout(debouncers.get(key));
+    debouncers.set(key, setTimeout(fn, ms));
+  }
+  function toast(text) {
+    const el = $("toast");
+    el.textContent = text; el.style.opacity = 1;
+    setTimeout(() => { el.style.opacity = 0; }, 2600);
+  }
+  const colorOf = (sid) => `var(${COLORS[(parseInt(sid.slice(1), 10) - 1) % COLORS.length]})`;
+  const mmss = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+  const nameOf = (sid) => (state.speakers.find(x => x.id === sid) || {name: sid}).name;
+
+  // ---- rendering -----------------------------------------------------
+  function render() {
+    if (!state) return;
+    const editing = document.activeElement;
+    if ($("title") !== editing) $("title").value = state.title || "";
+
+    renderStatus();
+    renderSpeakers(editing);
+    renderTranscript(editing);
+    renderSummary(editing);
+    renderFooter();
+  }
+
+  function renderStatus() {
+    const pill = $("status"), txt = $("statusText");
+    pill.classList.toggle("rec", state.status === "recording");
+    const labels = {
+      idle: "waiting for a session", recording: "recording",
+      summarizing: "summarizing…", review: "review & save",
+      saved: "saved ✓", discarded: "discarded",
+    };
+    txt.innerHTML = state.status === "summarizing" ? '<span class="spin"></span>summarizing…'
+                                                   : (labels[state.status] || state.status);
+    if (state.status === "recording" && !timer) timer = setInterval(tick, 1000);
+    if (state.status !== "recording" && timer) { clearInterval(timer); timer = null; }
+  }
+
+  function tick() {
+    $("clock").textContent = mmss(baseElapsed + (Date.now() - baseAt) / 1000);
+  }
+
+  function renderSpeakers(editing) {
+    const box = $("speakers");
+    if (box.contains(editing)) return; // don't yank a rename mid-type
+    box.replaceChildren();
+    for (const sp of state.speakers) {
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      const sw = document.createElement("span");
+      sw.className = "swatch"; sw.style.background = colorOf(sp.id);
+      const inp = document.createElement("input");
+      inp.value = sp.name; inp.spellcheck = false;
+      inp.size = Math.max(6, sp.name.length);
+      inp.title = `Rename ${sp.id}`;
+      inp.addEventListener("focus", () => inp.select());  // typing replaces "Speaker N"
+      inp.addEventListener("input", () => {
+        inp.size = Math.max(6, inp.value.length);
+        debounced(`n:${sp.id}`, 500, () => send({op: "rename", speaker: sp.id, name: inp.value}));
+      });
+      inp.addEventListener("keydown", (e) => { if (e.key === "Enter") inp.blur(); });
+      chip.append(sw, inp);
+      box.append(chip);
+    }
+    if (state.status === "recording" || state.status === "review" || state.status === "saved") {
+      const add = document.createElement("span");
+      add.className = "chip add"; add.textContent = "+ speaker";
+      add.addEventListener("click", () => send({op: "add_speaker"}));
+      box.append(add);
+    }
+  }
+
+  function renderTranscript(editing) {
+    const box = $("transcript");
+    if (box.contains(editing)) return; // don't clobber an in-progress text edit
+    box.replaceChildren();
+    for (const seg of state.segments) {
+      const row = document.createElement("div");
+      row.className = "seg"; row.dataset.id = seg.id;
+
+      const who = document.createElement("div"); who.className = "who";
+      const btn = document.createElement("button");
+      btn.textContent = nameOf(seg.speaker);
+      btn.style.color = colorOf(seg.speaker);
+      btn.title = "Move this line to the next speaker";
+      btn.addEventListener("click", () => {
+        const ids = state.speakers.map(s => s.id);
+        const next = ids[(ids.indexOf(seg.speaker) + 1) % ids.length];
+        if (next && next !== seg.speaker) send({op: "reassign", id: seg.id, speaker: next});
+      });
+      const t = document.createElement("span");
+      t.className = "t"; t.textContent = mmss(seg.t0);
+      who.append(btn, t);
+
+      const txt = document.createElement("div");
+      txt.className = "txt"; txt.contentEditable = "plaintext-only";
+      txt.textContent = seg.text; txt.spellcheck = false;
+      txt.addEventListener("input", () =>
+        debounced(`s:${seg.id}`, 600, () => send({op: "edit_segment", id: seg.id, text: txt.textContent})));
+      txt.addEventListener("blur", () => send({op: "edit_segment", id: seg.id, text: txt.textContent}));
+
+      const del = document.createElement("button");
+      del.className = "del"; del.textContent = "✕"; del.title = "Delete this line";
+      del.addEventListener("click", () => send({op: "delete_segment", id: seg.id}));
+
+      row.append(who, txt, del);
+      box.append(row);
+    }
+    if (state.status === "recording") window.scrollTo(0, document.body.scrollHeight);
+  }
+
+  function renderSummary(editing) {
+    const card = $("summaryCard"), ta = $("summary");
+    const show = ["summarizing", "review", "saved", "discarded"].includes(state.status);
+    card.classList.toggle("hidden", !show);
+    $("summaryHead").innerHTML = state.status === "summarizing"
+      ? '<span class="spin"></span>WRITING THE AI OVERVIEW…' : "AI OVERVIEW";
+    if (ta !== editing) ta.value = state.summary || "";
+  }
+
+  function renderFooter() {
+    const rec = state.status === "recording";
+    $("endBtn").classList.toggle("hidden", !rec);
+    $("hintbar").classList.toggle("hidden", !rec);
+    $("saveBtn").classList.toggle("hidden", !(state.status === "review" || state.status === "saved"));
+    $("saveBtn").textContent = state.status === "saved" ? "Saved ✓ — save again" : "Save to vault";
+    $("discardBtn").classList.toggle("hidden", !(rec || state.status === "review"));
+    $("partial").classList.toggle("hidden", !rec);
+    if (!rec) $("partial").textContent = "";
+  }
+
+  // ---- wiring ----------------------------------------------------------
+  $("title").addEventListener("input", () =>
+    debounced("title", 500, () => send({op: "set_title", title: $("title").value})));
+  $("summary").addEventListener("input", () =>
+    debounced("summary", 600, () => send({op: "edit_summary", markdown: $("summary").value})));
+  $("endBtn").addEventListener("click", () => send({op: "end"}));
+  $("saveBtn").addEventListener("click", () => send({op: "save"}));
+  $("discardBtn").addEventListener("click", () => {
+    if (window.confirm("Discard this whole session? The transcript will be lost.")) send({op: "discard"});
+  });
+
+  function connect() {
+    ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === "state") {
+        const prevSaved = state && state.saved_path;
+        state = msg;
+        baseElapsed = msg.elapsed_s || 0; baseAt = Date.now();
+        render(); tick();
+        if (msg.saved_path && msg.saved_path !== prevSaved) toast(`Saved to ${msg.saved_path}`);
+      } else if (msg.type === "partial") {
+        $("partial").textContent = msg.text || "";
+      } else if (msg.type === "error") {
+        toast(msg.message || "something went wrong");
+      }
+    };
+    ws.onclose = () => { $("statusText").textContent = "reconnecting…"; setTimeout(connect, 1200); };
+  }
+  connect();
+})();
+</script>
+</body>
+</html>
