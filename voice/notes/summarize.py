@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from notes.session import SessionState, display_name
@@ -78,10 +79,27 @@ def build_messages(state: SessionState) -> list[dict[str, str]]:
     ]
 
 
+def _unwrap_json(raw: str) -> str:
+    """Pull the JSON object out of a model reply.
+
+    Local gemma often ignores the constrained-decoding `format` and wraps its
+    JSON in a ```json … ``` code fence (or adds a line of prose), which made
+    json.loads fail and the whole fenced blob leak into the note verbatim.
+    Strip a leading/trailing fence, then narrow to the outermost {...} so a
+    stray preamble/suffix can't break the parse.
+    """
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[A-Za-z0-9]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    start, end = text.find("{"), text.rfind("}")
+    return text[start:end + 1] if start != -1 and end > start else text
+
+
 def parse_overview(raw: str) -> dict[str, Any] | None:
     """Parse the model's JSON reply; None if it isn't the expected shape."""
     try:
-        obj = json.loads(raw)
+        obj = json.loads(_unwrap_json(raw))
     except (json.JSONDecodeError, TypeError):
         return None
     if not isinstance(obj, dict) or not isinstance(obj.get("summary"), list):
@@ -105,9 +123,16 @@ def render_overview(overview: dict[str, Any]) -> str:
     grouped: dict[str, list[str]] = {}
     if isinstance(items, list):
         for it in items:
-            if isinstance(it, dict) and str(it.get("item", "")).strip():
-                person = str(it.get("person", "")).strip() or "Unassigned"
-                grouped.setdefault(person, []).append(str(it["item"]).strip())
+            if not isinstance(it, dict):
+                continue
+            # The model isn't consistent about the key name for the task text
+            # ("item" per our schema, but it often emits "task" or "action"),
+            # so accept the common synonyms rather than silently dropping it.
+            task = str(it.get("item") or it.get("task") or it.get("action") or "").strip()
+            if not task:
+                continue
+            person = str(it.get("person") or it.get("owner") or "").strip() or "Unassigned"
+            grouped.setdefault(person, []).append(task)
     if grouped:
         for person, tasks in grouped.items():
             parts += [f"- **{person}**"] + [f"  - [ ] {t}" for t in tasks]

@@ -48,6 +48,27 @@ def test_parse_rejects_non_schema_replies() -> None:
     assert ok == {"summary": ["x"]}
 
 
+def test_parse_unwraps_a_fenced_json_reply() -> None:
+    # gemma often ignores the constrained-decoding format and wraps its JSON in a
+    # ```json fence (+ a line of prose), which used to leak verbatim into the note.
+    raw = 'Here is the summary:\n```json\n{"summary": ["did things"]}\n```'
+    assert parse_overview(raw) == {"summary": ["did things"]}
+
+
+def test_render_tolerates_task_person_key_variants() -> None:
+    # The model isn't consistent about the action-item key: "task"/"action" are
+    # accepted alongside our schema's "item" so the item isn't silently dropped.
+    md = render_overview({
+        "summary": ["x"],
+        "action_items": [
+            {"task": "harden diarization", "person": "Navin"},
+            {"action": "take a subscription", "owner": "Dad"},
+        ],
+    })
+    assert "- **Navin**" in md and "  - [ ] harden diarization" in md
+    assert "- **Dad**" in md and "  - [ ] take a subscription" in md
+
+
 def test_render_groups_action_items_by_person() -> None:
     md = render_overview({
         "summary": ["shipped things"],
