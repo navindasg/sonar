@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from notes.diarize import Assignment, SpeakerRegistry
+from notes.diarize import Assignment, SpeakerRegistry, split_runs
 
 A = np.array([1.0, 0.0, 0.0], dtype=np.float32)
 B = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -101,3 +101,32 @@ def test_none_first_then_real_embedding_does_not_crash_or_drop() -> None:
     # every turn got a label — the real embedding after the None was NOT dropped
     assert [a.speaker for a in (a0, a1, a2, a3)] == ["S1", "S1", "S1", "S2"]
     assert reg.speakers == ["S1", "S2"]
+
+
+# --- sub-utterance change-point splitting (mid-utterance speaker changes) ---
+
+def test_split_runs_finds_one_boundary() -> None:
+    # 3 windows of A then 3 of B -> two runs split at the change.
+    runs = split_runs([A, A, A, B, B, B])
+    assert runs == [(0, 3), (3, 6)]
+
+
+def test_split_runs_single_speaker_is_one_run() -> None:
+    assert split_runs([A, A_ISH, A, A_ISH]) == [(0, 4)]
+
+
+def test_split_runs_handles_three_speakers() -> None:
+    runs = split_runs([A, A, B, B, C, C])
+    assert runs == [(0, 2), (2, 4), (4, 6)]
+
+
+def test_split_runs_merges_a_lone_noisy_window() -> None:
+    # A single odd window (min_run=2 default) must not spawn its own speaker run;
+    # it folds into whichever neighbour it resembles more, leaving one run here.
+    runs = split_runs([A, A, B, A, A])
+    assert runs == [(0, 5)]
+
+
+def test_split_runs_empty_and_singleton() -> None:
+    assert split_runs([]) == []
+    assert split_runs([A]) == [(0, 1)]

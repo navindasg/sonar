@@ -28,9 +28,11 @@ from typing import Any, Awaitable, Callable
 
 from osvoice.vad import Endpointer, VadEvent
 
+import numpy as np
+
 from notes import session as sess
 from notes import store
-from notes.diarize import SpeakerRegistry
+from notes.diarize import DEFAULT_SPLIT_THRESHOLD, SpeakerRegistry, split_runs
 from notes.embed import EcapaEmbedder
 from notes.intent import wants_notes_stop
 from notes.server import NotesServer
@@ -38,10 +40,14 @@ from notes.summarize import DEFAULT_MODEL, summarize
 
 log = logging.getLogger("sonar.notes")
 
-_FRAME_S = 512 / 16_000            # one Silero frame = 32 ms
+_SAMPLE_RATE = 16_000
+_FRAME_S = 512 / _SAMPLE_RATE      # one Silero frame = 32 ms
 _PREROLL_FRAMES = 8                # ~256 ms lead-in, same as the voice loop
 _PARTIAL_FRAMES = 24               # live partial every ~768 ms (transcribe is shared with MLX)
 _MIN_UTTER_FRAMES = 7              # <~224 ms: too short for parakeet to say anything
+# Only re-diarize WITHIN an utterance longer than this — short turns are almost
+# always one speaker, and windowing them just burns CPU for no split.
+_MIN_SPLIT_S = 2.5
 
 Transcribe = Callable[[bytes], Awaitable[str]]
 
@@ -71,6 +77,13 @@ class NotesController:
         self._open_browser = open_browser
         self._silence_ms = silence_ms or int(os.environ.get("SONAR_NOTES_SILENCE_MS", "700"))
         self._threshold = sim_threshold or float(os.environ.get("SONAR_NOTES_SIM_THRESHOLD", "0.40"))
+        # Sub-utterance re-diarization: split a merged turn where the voice changes
+        # without a full pause. On by default; SONAR_NOTES_SPLIT=0 reverts to one
+        # speaker per endpointed utterance.
+        self._split_enabled = os.environ.get("SONAR_NOTES_SPLIT", "1") != "0"
+        self._split_threshold = float(
+            os.environ.get("SONAR_NOTES_SPLIT_THRESHOLD", str(DEFAULT_SPLIT_THRESHOLD))
+        )
         self.on_ended = on_ended
         self.server = NotesServer(self, host=host, port=port)
 
@@ -236,28 +249,92 @@ class NotesController:
     async def _handle_utterance(self, pcm: bytes, t0: float, t1: float) -> None:
         if self.state is None or self.state.status != sess.RECORDING:
             return
+        text = await self._safe_transcribe(pcm)
+        if text is None:
+            return  # STT failed (toasted) — do not add a phantom empty line
+        if not text.strip():
+            return
+        # Stop-check on the WHOLE utterance first (before any speaker assignment),
+        # so the command that ends the session never enters the transcript.
+        if wants_notes_stop(text):
+            asyncio.create_task(self.end())
+            return
+        parts = await self._diarize_utterance(pcm, text, t0, t1)
+        for speaker, seg_text, st0, st1 in parts:
+            self.state = sess.add_segment(self.state, speaker, seg_text, st0, st1)
+        await self.server.broadcast({"type": "partial", "text": ""})
+        await self._broadcast_state()
+
+    async def _safe_transcribe(self, pcm: bytes) -> str | None:
+        """Transcribe, or None + a UI toast on failure (never a silent drop)."""
         try:
-            text = await self._transcribe(pcm)
+            return await self._transcribe(pcm)
         except Exception as exc:  # noqa: BLE001 — a failed STT must not silently drop a line
             # This utterance had real audio (it cleared the min-frames gate), so
-            # an exception here means transcription FAILED, not that the room was
-            # quiet — say so rather than dropping the line invisibly.
+            # an exception means transcription FAILED, not that the room was quiet.
             log.warning("notes transcription failed: %s", exc)
             await self.server.broadcast(
                 {"type": "error", "message": "a line couldn't be transcribed"}
             )
-            return
-        if not text.strip():
-            return
-        if wants_notes_stop(text):
-            # The stop command itself never enters the transcript.
-            asyncio.create_task(self.end())
-            return
-        emb = await self._embedder.embed(pcm) if self._embed_ok else None
-        assignment = self._registry.assign(emb, duration_s=t1 - t0)
-        self.state = sess.add_segment(self.state, assignment.speaker, text, t0, t1)
-        await self.server.broadcast({"type": "partial", "text": ""})
-        await self._broadcast_state()
+            return None
+
+    async def _diarize_utterance(
+        self, pcm: bytes, text: str, t0: float, t1: float
+    ) -> list[tuple[str, str, float, float]]:
+        """One utterance -> one or more (speaker, text, t0, t1) parts.
+
+        Long utterances are re-diarized with overlapping windows: where the voice
+        changes mid-utterance without a full pause (which the silence endpointer
+        can't split), the audio is cut at the change and each part re-transcribed
+        and assigned separately. Short/single-voice utterances stay one segment.
+        NOTE: this catches rapid speaker CHANGES, not truly simultaneous overlap
+        (two voices at once) — separating concurrent speech needs source
+        separation we don't run on-device.
+        """
+        if not (self._embed_ok and self._split_enabled and (t1 - t0) >= _MIN_SPLIT_S):
+            emb = await self._embedder.embed(pcm) if self._embed_ok else None
+            speaker = self._registry.assign(emb, duration_s=t1 - t0).speaker
+            return [(speaker, text, t0, t1)]
+
+        windows = await self._embedder.embed_windows(pcm)
+        runs = split_runs([w[2] for w in windows], self._split_threshold) if windows else []
+        if len(runs) <= 1:
+            # single voice across the utterance: one assignment from the window
+            # mean (or a whole-utterance embedding if windowing was unavailable).
+            emb = (
+                np.mean([w[2] for w in windows], axis=0)
+                if windows else await self._embedder.embed(pcm)
+            )
+            speaker = self._registry.assign(emb, duration_s=t1 - t0).speaker
+            return [(speaker, text, t0, t1)]
+        return await self._split_parts(pcm, windows, runs, t0)
+
+    async def _split_parts(
+        self,
+        pcm: bytes,
+        windows: list[tuple[int, int, Any]],
+        runs: list[tuple[int, int]],
+        t0: float,
+    ) -> list[tuple[str, str, float, float]]:
+        """Re-transcribe + assign each speaker-run of a split utterance."""
+        total_samples = len(pcm) // 2
+        # Cut at the start sample of each run after the first; the last part runs
+        # to the end so no audio is dropped.
+        cuts = [windows[r[0]][0] for r in runs] + [total_samples]
+        parts: list[tuple[str, str, float, float]] = []
+        for i, (run_start, run_end) in enumerate(runs):
+            lo, hi = cuts[i], cuts[i + 1]
+            if hi - lo <= 0:
+                continue
+            sub_pcm = pcm[lo * 2:hi * 2]
+            sub_text = await self._safe_transcribe(sub_pcm)
+            if not sub_text or not sub_text.strip():
+                continue
+            run_emb = np.mean([windows[j][2] for j in range(run_start, run_end)], axis=0)
+            dur = (hi - lo) / _SAMPLE_RATE
+            speaker = self._registry.assign(run_emb, duration_s=dur).speaker
+            parts.append((speaker, sub_text, t0 + lo / _SAMPLE_RATE, t0 + hi / _SAMPLE_RATE))
+        return parts
 
     # ---- ending / saving ------------------------------------------------
     async def end(self) -> None:

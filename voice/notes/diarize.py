@@ -24,6 +24,9 @@ import numpy as np
 DEFAULT_THRESHOLD = 0.40
 DEFAULT_MIN_NEW_SECONDS = 1.0
 DEFAULT_MAX_SPEAKERS = 8
+# A speaker-change boundary is placed between two adjacent windows whose voice
+# fingerprints are less alike than this. Higher = split more eagerly.
+DEFAULT_SPLIT_THRESHOLD = 0.50
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,105 @@ def _unit(v: np.ndarray) -> np.ndarray:
     arr = np.asarray(v, dtype=np.float32).reshape(-1)
     norm = float(np.linalg.norm(arr))
     return arr / norm if norm > 0.0 else arr
+
+
+def split_runs(
+    embeddings: list[np.ndarray],
+    threshold: float = DEFAULT_SPLIT_THRESHOLD,
+    min_run: int = 2,
+) -> list[tuple[int, int]]:
+    """Group ordered window embeddings into same-speaker runs.
+
+    Walks the sequence of per-window voice fingerprints and cuts a boundary
+    wherever two adjacent windows are less alike than ``threshold`` (a speaker
+    change with little or no pause — the case the silence endpointer can't
+    catch). Returns ``(start, end_exclusive)`` window-index ranges covering the
+    whole sequence. Runs shorter than ``min_run`` windows are merged into a
+    neighbour so a single noisy window can't spawn a spurious split.
+
+    Pure (numpy only) so it unit-tests without the embedding backend.
+    """
+    n = len(embeddings)
+    if n == 0:
+        return []
+    if n == 1:
+        return [(0, 1)]
+    units = [_unit(e) for e in embeddings]
+    cuts: list[int] = [0]
+    for i in range(1, n):
+        if float(np.dot(units[i - 1], units[i])) < threshold:
+            cuts.append(i)
+    cuts.append(n)
+    runs = [(cuts[i], cuts[i + 1]) for i in range(len(cuts) - 1)]
+    runs = _merge_short_runs(runs, units, min_run)
+    # A lone noisy window leaves two abutting runs whose means are still alike;
+    # coalesce adjacent runs that are similar enough to be the same voice so a
+    # blip never counts as a real speaker change.
+    return _coalesce_similar(runs, units, threshold)
+
+
+def _coalesce_similar(
+    runs: list[tuple[int, int]], units: list[np.ndarray], threshold: float
+) -> list[tuple[int, int]]:
+    """Merge adjacent runs whose mean fingerprints are >= ``threshold`` alike."""
+    changed = True
+    while changed and len(runs) > 1:
+        changed = False
+        for i in range(len(runs) - 1):
+            a, b = runs[i], runs[i + 1]
+            if float(np.dot(_mean_unit(units, a), _mean_unit(units, b))) >= threshold:
+                runs = runs[:i] + [(a[0], b[1])] + runs[i + 2:]
+                changed = True
+                break
+    return runs
+
+
+def _merge_short_runs(
+    runs: list[tuple[int, int]], units: list[np.ndarray], min_run: int
+) -> list[tuple[int, int]]:
+    """Fold runs shorter than ``min_run`` windows into the more similar
+    neighbour, then coalesce adjacent runs (a short run between two long ones can
+    leave two abutting ranges). Keeps only confident speaker changes."""
+    if len(runs) <= 1:
+        return runs
+    changed = True
+    while changed and len(runs) > 1:
+        changed = False
+        for i, (s, e) in enumerate(runs):
+            if e - s >= min_run:
+                continue
+            # too short to trust as its own speaker: merge left or right, toward
+            # whichever neighbour's mean embedding it resembles more.
+            left = runs[i - 1] if i > 0 else None
+            right = runs[i + 1] if i + 1 < len(runs) else None
+            target = _closer_neighbour((s, e), left, right, units)
+            merged = (min(target[0], s), max(target[1], e))
+            runs = [r for j, r in enumerate(runs) if r not in ((s, e), target)]
+            runs.insert(min(i, len(runs)), merged)
+            runs.sort()
+            changed = True
+            break
+    return runs
+
+
+def _mean_unit(units: list[np.ndarray], span: tuple[int, int]) -> np.ndarray:
+    return _unit(np.mean(units[span[0]:span[1]], axis=0))
+
+
+def _closer_neighbour(
+    span: tuple[int, int],
+    left: tuple[int, int] | None,
+    right: tuple[int, int] | None,
+    units: list[np.ndarray],
+) -> tuple[int, int]:
+    """Pick the neighbour whose mean fingerprint the short span resembles more."""
+    me = _mean_unit(units, span)
+    scores = []
+    if left is not None:
+        scores.append((float(np.dot(me, _mean_unit(units, left))), left))
+    if right is not None:
+        scores.append((float(np.dot(me, _mean_unit(units, right))), right))
+    return max(scores)[1]
 
 
 class SpeakerRegistry:

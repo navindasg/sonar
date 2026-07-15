@@ -22,6 +22,7 @@ class FakeEmbedder:
 
     def __init__(self) -> None:
         self.queue: list[np.ndarray | None] = []
+        self.windows: list[tuple[int, int, np.ndarray]] = []  # for the split path
         self.loaded = False
 
     async def load(self) -> None:
@@ -29,6 +30,9 @@ class FakeEmbedder:
 
     async def embed(self, _pcm: bytes) -> np.ndarray | None:
         return self.queue.pop(0) if self.queue else None
+
+    async def embed_windows(self, _pcm: bytes):
+        return list(self.windows)
 
 
 class FakeStt:
@@ -93,6 +97,43 @@ async def test_utterances_become_diarized_segments(rig) -> None:
     assert [s.speaker for s in segs] == ["S1", "S2"]
     assert segs[0].t0 < segs[0].t1 <= segs[1].t0 < segs[1].t1
     assert ctl.state.status == sess.RECORDING
+
+
+async def test_long_utterance_splits_on_mid_utterance_speaker_change(rig) -> None:
+    # A merged turn (no full pause) where the voice changes partway is split into
+    # two segments with different speakers and re-transcribed per part.
+    ctl, stt, emb = rig
+    A = np.array([1.0, 0.0], dtype=np.float32)
+    B = np.array([0.0, 1.0], dtype=np.float32)
+    emb.windows = [
+        (0, 24000, A), (8000, 32000, A), (16000, 40000, A),   # speaker A
+        (24000, 48000, B), (32000, 56000, B), (40000, 64000, B),  # speaker B
+    ]
+    stt.queue = [
+        "hey how are you doing today good thanks",   # whole-utterance (stop-check)
+        "hey how are you doing today",               # run 1 (A)
+        "good thanks",                               # run 2 (B)
+    ]
+    _speak(ctl, frames=120)                          # ~3.9 s -> past the 2.5 s split floor
+    await _drain(ctl)
+
+    segs = ctl.state.segments
+    assert [s.text for s in segs] == ["hey how are you doing today", "good thanks"]
+    assert segs[0].speaker != segs[1].speaker
+    assert segs[0].t0 < segs[0].t1 <= segs[1].t0 < segs[1].t1
+
+
+async def test_long_single_voice_utterance_stays_one_segment(rig) -> None:
+    # Windows that don't change speaker must NOT split.
+    ctl, stt, emb = rig
+    A = np.array([1.0, 0.0], dtype=np.float32)
+    emb.windows = [(0, 24000, A), (8000, 32000, A), (16000, 40000, A), (24000, 48000, A)]
+    stt.queue = ["one long uninterrupted thought from a single speaker"]
+    _speak(ctl, frames=120)
+    await _drain(ctl)
+    assert [s.text for s in ctl.state.segments] == [
+        "one long uninterrupted thought from a single speaker"
+    ]
 
 
 async def test_empty_transcription_adds_nothing(rig) -> None:

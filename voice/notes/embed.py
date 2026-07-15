@@ -26,7 +26,10 @@ from osvoice.audio import pcm16_to_float32
 log = logging.getLogger("sonar.notes.embed")
 
 _DEFAULT_SOURCE = "speechbrain/spkrec-ecapa-voxceleb"
-_MIN_EMBED_SAMPLES = 16_000 // 4   # <250 ms has no stable speaker signal
+_SAMPLE_RATE = 16_000
+_MIN_EMBED_SAMPLES = _SAMPLE_RATE // 4   # <250 ms has no stable speaker signal
+_WINDOW_S = 1.5                          # per-window span for sub-utterance diarization
+_HOP_S = 0.75                            # window stride (overlap smooths the boundary)
 
 
 def _cache_dir() -> Path:
@@ -83,6 +86,45 @@ class EcapaEmbedder:
         with self._torch.no_grad():
             emb = self._encoder.encode_batch(wav)
         return emb.squeeze().cpu().numpy().astype(np.float32)
+
+    async def embed_windows(
+        self, pcm: bytes, window_s: float = _WINDOW_S, hop_s: float = _HOP_S
+    ) -> list[tuple[int, int, np.ndarray]]:
+        """Embed overlapping windows across a long utterance.
+
+        Returns ``(start_sample, end_sample, embedding)`` per window so the
+        controller can detect a mid-utterance speaker change (diarize.split_runs)
+        and cut the utterance where the voice changes. Returns [] when the
+        encoder is unavailable or the audio is too short for two windows — the
+        caller then falls back to a single whole-utterance embedding.
+        """
+        if self._encoder is None:
+            return []
+        samples = pcm16_to_float32(pcm)
+        win, hop = int(window_s * _SAMPLE_RATE), int(hop_s * _SAMPLE_RATE)
+        if hop <= 0 or samples.size < win + hop:
+            return []
+        spans = [(s, s + win) for s in range(0, samples.size - win + 1, hop)]
+        # Cover any leftover tail so the end of the utterance isn't dropped.
+        if spans and spans[-1][1] < samples.size - hop // 2:
+            spans.append((samples.size - win, samples.size))
+        try:
+            embs = await asyncio.to_thread(self._embed_windows_blocking, samples, spans)
+        except Exception as exc:  # noqa: BLE001 — degrade to whole-utterance embedding
+            log.warning("windowed embedding failed: %s", exc)
+            return []
+        return [(s, e, emb) for (s, e), emb in zip(spans, embs)]
+
+    def _embed_windows_blocking(
+        self, samples: np.ndarray, spans: list[tuple[int, int]]
+    ) -> list[np.ndarray]:
+        out: list[np.ndarray] = []
+        for s, e in spans:
+            wav = self._torch.from_numpy(np.ascontiguousarray(samples[s:e])).float().unsqueeze(0)
+            with self._torch.no_grad():
+                emb = self._encoder.encode_batch(wav)
+            out.append(emb.squeeze().cpu().numpy().astype(np.float32))
+        return out
 
     async def aclose(self) -> None:
         self._encoder = None
