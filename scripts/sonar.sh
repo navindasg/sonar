@@ -95,6 +95,20 @@ _ensure_hammerspoon() {
   _remap_active || echo "overlay: ! F5->F13 remap not active — run scripts/hotkey/remap.sh (or use the ⌘⌃⌥G chord)"
 }
 
+# After the overlay's :$GLOW_PORT server (re)starts, Hammerspoon does NOT reliably
+# reconnect on its own — its WS heartbeat can stall, so the box goes dead whenever
+# :8770 changes hands (bridge <-> voice loop, or a KeepAlive respawn). Nudge it:
+# wait (in the background) for the server to bind, then reload the HS config so the
+# glow reconnects to whatever now owns :$GLOW_PORT. Backgrounded so callers can exec
+# the server right after; a no-op if Hammerspoon isn't installed.
+_reconnect_overlay() {
+  _hs_installed || return 0
+  ( i=0
+    while [ "$i" -lt 60 ]; do _port_up "$GLOW_PORT" && break; sleep 0.5; i=$((i+1)); done
+    sleep 1.5
+    _hs_running && hs -c 'hs.reload()' >/dev/null 2>&1 ) >/dev/null 2>&1 &
+}
+
 _wait_for() {  # _wait_for <label> <predicate-cmd...> — poll ~120s
   local label="$1"; shift
   local i
@@ -198,6 +212,7 @@ cmd_up() {
 
   # Overlay ------------------------------------------------------------------
   _ensure_hammerspoon
+  _reconnect_overlay   # bridge just (re)bound :8770 — make the glow reconnect to it
 
   echo
   cmd_status
@@ -239,6 +254,7 @@ cmd_voice() {
   echo "starting voice loop on :${GLOW_PORT} — press F5, speak, listen. Ctrl-C to stop."
   echo "(first run downloads STT + TTS models and prompts for Microphone access)"
   echo
+  _reconnect_overlay   # once the loop binds :8770, reconnect the glow to it
   # Foreground exec: inherits this terminal's TTY + mic/speaker TCC grants.
   cd "$REPO_ROOT/voice" && exec env \
     SONAR_HARNESS_URL="http://127.0.0.1:${HARNESS_PORT}" \
@@ -370,6 +386,7 @@ cmd_exec_harness() {
 cmd_exec_bridge() {
   mkdir -p "$LOG_DIR" "$RUN_DIR"
   _wait_for "harness /health" _health || exit 1
+  _reconnect_overlay   # bridge is (re)starting on :8770 — reconnect the glow to it
   cd "$REPO_ROOT" && exec env \
     SONAR_HARNESS_URL="http://127.0.0.1:${HARNESS_PORT}" \
     SONAR_GLOW_PORT="$GLOW_PORT" \
@@ -390,6 +407,7 @@ cmd_exec_voice() {
     rm -f "$RUN_DIR/bridge.pid"
     _wait_for ":${GLOW_PORT} free" bash -c "! lsof -ti tcp:${GLOW_PORT} >/dev/null 2>&1" || true
   fi
+  _reconnect_overlay   # once the loop binds :8770, reconnect the glow to it
   cd "$REPO_ROOT/voice" && exec env \
     SONAR_HARNESS_URL="http://127.0.0.1:${HARNESS_PORT}" \
     SONAR_GLOW_PORT="$GLOW_PORT" \
