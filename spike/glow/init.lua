@@ -12,7 +12,6 @@ local WS_HOST = os.getenv("SONAR_GLOW_HOST") or "127.0.0.1"
 local WS_PORT = os.getenv("SONAR_GLOW_PORT") or "8770"
 local WS_URL  = "ws://" .. WS_HOST .. ":" .. WS_PORT
 local FPS     = 30
-local RECONNECT_AFTER = 2.0
 
 -- Overall glow opacity per state — NO colour change, just how deep the cave is.
 local INTENSITY = { idle = 0.16, listening = 0.92, thinking = 0.96, speaking = 1.0 }
@@ -29,7 +28,7 @@ local TEXTURE = scriptDir() .. "vignette.png"
 local M = {
   canvases = {}, ws = nil, animTimer = nil, screenWatcher = nil,
   phase = 0.0, visible = false, state = "idle", level = 0.0,
-  reconnecting = false, wsOpen = false, texture = nil,
+  wsGen = 0, wsOpen = false, texture = nil,
   bar = nil, barUCC = nil, lastTyped = nil, committed = "",
 }
 M.texture = hs.image.imageFromPath(TEXTURE)
@@ -273,17 +272,20 @@ end
 
 -- ============================================================ websocket
 local connect
-local function scheduleReconnect()
-  if M.reconnecting then return end
-  M.reconnecting = true
-  hs.timer.doAfter(RECONNECT_AFTER, function() M.reconnecting = false; connect() end)
-end
+-- Reconnect is driven by the heartbeat in start(), which checks the socket's REAL
+-- status(). A server killed abruptly (bridge <-> voice swap, KeepAlive respawn)
+-- often never delivers a "closed"/"fail" callback, so the old cached-flag logic
+-- left M.wsOpen stale-true and never retried. Each connect() bumps M.wsGen so a
+-- late event from a superseded socket can't clobber the current one.
 connect = function()
-  -- Close any prior socket first so reloads/heartbeats don't pile up stale
-  -- connections on the bridge (each would double-drive the mic).
+  M.wsGen = (M.wsGen or 0) + 1
+  local gen = M.wsGen
+  -- Close any prior socket first so reconnects don't pile up stale connections
+  -- on the server (each would double-drive the mic).
   if M.ws then pcall(function() M.ws:close() end); M.ws = nil; M.wsOpen = false end
   local ok, ws = pcall(hs.websocket.new, WS_URL, function(status, message)
-    if status == "open" then M.reconnecting = false; M.wsOpen = true
+    if gen ~= M.wsGen then return end   -- stale socket: ignore its late events
+    if status == "open" then M.wsOpen = true
     elseif status == "received" then
       M.rxCount = (M.rxCount or 0) + 1
       M.lastRx = message
@@ -308,10 +310,10 @@ connect = function()
         print("[sonar-rx] decode failed: " .. tostring(message))
       end
     elseif status == "closed" or status == "fail" then
-      M.ws = nil; M.wsOpen = false; scheduleReconnect()
+      M.wsOpen = false   -- connect() owns M.ws; don't null a possibly-newer socket
     end
   end)
-  if ok then M.ws = ws else scheduleReconnect() end
+  if ok then M.ws = ws else M.ws = nil; M.wsOpen = false end
 end
 
 -- ============================================================ summon + wiring
@@ -350,10 +352,14 @@ local function start()
     if M.visible then render() end
   end)
   connect()
-  -- Heartbeat: if the socket isn't open, reconnect. Survives the STT bridge
-  -- restarting without needing a manual hs.reload().
-  M.heartbeat = hs.timer.doEvery(3, function()
-    if not M.wsOpen and not M.reconnecting then connect() end
+  -- Heartbeat: reconnect whenever the socket isn't actually open. We query the
+  -- socket's REAL status() rather than the cached M.wsOpen flag, because a server
+  -- killed abruptly may never fire a close callback — the flag would stay stale-
+  -- true and we'd never reconnect. On localhost a dead port fails fast, so this
+  -- re-links the glow within ~2s of a bridge<->voice swap or a KeepAlive respawn.
+  M.heartbeat = hs.timer.doEvery(2, function()
+    local st = (M.ws and M.ws:status()) or "closed"
+    if st ~= "open" and st ~= "connecting" then connect() end
   end)
   -- Toggle on F13 (the remapped F5): press to show, press again to hide.
   hs.hotkey.bind({}, "f13", toggleOverlay)
