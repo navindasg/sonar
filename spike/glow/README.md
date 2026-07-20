@@ -1,12 +1,16 @@
 # S1 — glow spike (Hammerspoon + fake-state stub)
 
-Throwaway prototype that locks the **signature look**: a dark, pulsing, per-display
-screen-**edge** glow that reacts to fake assistant states (`idle → listening → thinking →
-speaking`) — with **no** real voice stack. This nails the aesthetic before the native Swift
+Throwaway prototype that locks the **signature look**: the Dark Knight "sonar" edge — a dark
+per-display screen-**edge** cave, fringed with small curvy **black spikes that slowly wave in
+wind**, rain drifting down, and sonar-blue (batsuit-eye) light leaking in that warms to amber
+while speaking. Reacts to assistant states (`idle → listening → thinking → speaking`), from the
+real bridge/voice stack or the fake-state stub. This nails the aesthetic before the native Swift
 `NSPanel` overlay is written.
 
-- `init.lua` — Hammerspoon config: per-display `hs.canvas` edge glow, click-through, floats
-  over full-screen apps, breathing pulse, `hs.websocket` **client** to the stub server.
+- `init.lua` — Hammerspoon config: per-display `hs.canvas` edge glow drawn **procedurally**
+  (waving-spike segments + cave/edge-light gradients + rain + sonar rings), click-through, floats
+  over full-screen apps, `hs.websocket` **client** to the bridge/stub. The look is env-tunable
+  (`SONAR_GLOW_INTENSITY/WIND/LEN/RAIN/SWEEP/REACTIVE/SPACING/SAMPLES`).
 - `stub_server.py` — standalone `uv` script (PEP 723) that plays a fake voice pipeline over a
   localhost WebSocket.
 
@@ -72,10 +76,10 @@ uv run stub_server.py --help
 
 With the stub server running you should see, on **every** display:
 
-- `idle` — glow essentially off / a barely-there charcoal rim.
-- `listening` — a cool dim blue breathing rim.
-- `thinking` — an amber pulse, a little faster.
-- `speaking` — a brighter warm ember pulse.
+- `idle` — a barely-there graphite rim, spikes calm.
+- `listening` — a cool sonar-blue cave, spikes waving, sonar rings pinging from a corner.
+- `thinking` — same sonar-blue (the cold "sonar" cue), spikes waving.
+- `speaking` — the edge light warms to sodium amber.
 
 The rim is click-through (you can click straight through it) and floats above other windows,
 including full-screen apps. Unplug/replug a display or change arrangement — it re-lays-out on its

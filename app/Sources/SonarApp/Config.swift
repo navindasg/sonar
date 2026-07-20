@@ -20,6 +20,10 @@ struct Config {
     let harnessURL: URL
     /// <harnessURL>/health.
     let healthURL: URL
+    /// http://127.0.0.1:<SONAR_GLOW_PORT|8770> — the voice/bridge WS server, hit
+    /// with a plain GET purely for a liveness probe (a WS server answers HTTP
+    /// with an error status, which still proves the port is up).
+    let voiceProbeURL: URL
     /// SONAR_VAULT_PATH (default ~/Documents/Obsidian Vault).
     let vaultPath: String
     /// SONAR_OLLAMA_URL (default http://127.0.0.1:11434).
@@ -54,6 +58,10 @@ struct Config {
             ?? URL(string: "http://127.0.0.1:8787")!
         let healthURL = harnessURL.appendingPathComponent("health")
 
+        let voicePort = value("SONAR_GLOW_PORT").flatMap { Int($0) } ?? 8770
+        let voiceProbeURL = URL(string: "http://127.0.0.1:\(voicePort)/")
+            ?? URL(string: "http://127.0.0.1:8770/")!
+
         let vaultPath = value("SONAR_VAULT_PATH")
             ?? (NSHomeDirectory() + "/Documents/Obsidian Vault")
         let ollamaURL = value("SONAR_OLLAMA_URL") ?? "http://127.0.0.1:11434"
@@ -70,6 +78,7 @@ struct Config {
             notesURL: notesURL,
             harnessURL: harnessURL,
             healthURL: healthURL,
+            voiceProbeURL: voiceProbeURL,
             vaultPath: vaultPath,
             ollamaURL: ollamaURL,
             repoRoot: repoRoot,
