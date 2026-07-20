@@ -1,12 +1,14 @@
-"""calendar.create — create an event on the user's Google Calendar.
+"""Calendar WRITE tools — create, reschedule, and cancel events.
 
-A WRITE tool (via the ``calendar.events`` OAuth scope). Kept `local` so the
-assistant can actually add events in a voice turn — a calendar event is the
-user's own, low-consequence, and easily deleted (unlike email send, which stays
-gated/draft-only). Not connected yet → returns a model-safe "run google-auth"
-string rather than crashing the turn.
+All three use the ``calendar.events`` OAuth scope and stay `local` so the
+assistant can manage the calendar in a voice turn — the events are the user's
+own and each action is reversible (a move can be moved back; a delete lands in
+Google's Trash, recoverable ~30 days), unlike email send (gated/draft-only).
+``reschedule``/``cancel`` take an ``event_id`` from ``calendar.agenda``; the model
+is told to confirm with the user first. Not connected yet → each returns a
+model-safe "run google-auth" string rather than crashing the turn.
 
-The event-body builder is pure and unit-tested; only ``run`` touches the network.
+The pure body/time builders are unit-tested; only ``run`` touches the network.
 """
 from __future__ import annotations
 
@@ -133,6 +135,173 @@ class CalendarCreateTool(ToolBase):
         link = str(event.get("htmlLink", "")).strip()
         ctx.emit(_summary("calendar.create", "created"))
         return f"Created '{body['summary']}' at {when}. {link}".strip()
+
+
+def _event_duration(event: dict[str, Any]) -> timedelta | None:
+    """Length of an existing timed event, or None (all-day / unparseable)."""
+    start = (event.get("start") or {}).get("dateTime")
+    end = (event.get("end") or {}).get("dateTime")
+    if not (isinstance(start, str) and isinstance(end, str)):
+        return None
+    try:
+        return _parse_dt(end) - _parse_dt(start)
+    except ValueError:
+        return None
+
+
+def rescheduled_times(
+    event: dict[str, Any],
+    new_start: datetime,
+    args: dict[str, Any],
+    *,
+    default_duration_min: int = _DEFAULT_DURATION_MIN,
+) -> tuple[datetime, datetime]:
+    """New (start, end) for a move: explicit ``end`` wins, else ``duration_minutes``,
+    else the event keeps its original length (else the 60-min default). Pure."""
+    end_raw = args.get("end")
+    if isinstance(end_raw, str) and end_raw.strip():
+        return new_start, _parse_dt(end_raw)
+    dur = args.get("duration_minutes")
+    if dur is not None:
+        try:
+            return new_start, new_start + timedelta(minutes=max(1, int(dur)))
+        except (TypeError, ValueError):
+            pass
+    original = _event_duration(event)
+    if original is not None and original > timedelta(0):
+        return new_start, new_start + original
+    return new_start, new_start + timedelta(minutes=default_duration_min)
+
+
+class CalendarRescheduleTool(ToolBase):
+    name = "calendar.reschedule"
+    description = (
+        "Move an existing calendar event to a new time. Provide 'event_id' (from "
+        "calendar.agenda) and a new 'start' ISO datetime (local time if no zone); "
+        "the event keeps its original length unless you also give 'end' or "
+        "'duration_minutes'. Use for 'move my 3pm to 4pm', 'push the meeting to "
+        "tomorrow morning'. Confirm the change with the user first."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "event_id": {
+                "type": "string",
+                "description": "The event's id, taken from a calendar.agenda result.",
+            },
+            "start": {
+                "type": "string",
+                "description": "New ISO-8601 start, e.g. '2026-07-10T16:00:00' (local if no offset).",
+            },
+            "end": {
+                "type": "string",
+                "description": "Optional new ISO-8601 end. Omit to keep the original length.",
+            },
+            "duration_minutes": {
+                "type": "integer",
+                "description": "Optional new length in minutes (used only when 'end' is omitted).",
+            },
+        },
+        "required": ["event_id", "start"],
+    }
+    permission = "local"
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> str:
+        event_id = args.get("event_id")
+        if not isinstance(event_id, str) or not event_id.strip():
+            return "error: calendar.reschedule requires an 'event_id' from calendar.agenda."
+        start_raw = args.get("start")
+        if not isinstance(start_raw, str) or not start_raw.strip():
+            return "error: calendar.reschedule requires a new 'start' ISO datetime."
+        try:
+            new_start = _parse_dt(start_raw)
+        except ValueError as exc:
+            return f"error: could not parse 'start' ({start_raw!r}): {exc}"
+
+        try:
+            service = build_service("calendar", "v3")
+        except GoogleAuthError as exc:
+            ctx.emit(_summary("calendar.reschedule", str(exc), status="error"))
+            return str(exc)
+
+        try:
+            event = (
+                service.events()
+                .get(calendarId="primary", eventId=event_id.strip())
+                .execute()
+            )
+        except Exception as exc:  # noqa: BLE001 — likely a bad/stale id
+            ctx.emit(_summary("calendar.reschedule", type(exc).__name__, status="error"))
+            return (
+                f"error: couldn't find that event ({type(exc).__name__}). "
+                "Re-check the agenda for the right event id."
+            )
+
+        try:
+            start, end = rescheduled_times(event, new_start, args)
+        except ValueError as exc:
+            return f"error: could not parse 'end': {exc}"
+
+        body = {
+            "start": {"dateTime": start.isoformat()},
+            "end": {"dateTime": end.isoformat()},
+        }
+        try:
+            updated = (
+                service.events()
+                .patch(calendarId="primary", eventId=event_id.strip(), body=body)
+                .execute()
+            )
+        except Exception as exc:  # noqa: BLE001 — map API failure to model text
+            ctx.emit(_summary("calendar.reschedule", type(exc).__name__, status="error"))
+            return f"error: Calendar reschedule failed ({type(exc).__name__}): {exc}"
+
+        title = str(updated.get("summary", "the event")).strip() or "the event"
+        ctx.emit(_summary("calendar.reschedule", "moved"))
+        return f"Moved '{title}' to {start.isoformat()}."
+
+
+class CalendarCancelTool(ToolBase):
+    name = "calendar.cancel"
+    description = (
+        "Cancel (delete) an existing calendar event. Provide 'event_id' (from "
+        "calendar.agenda). Use for 'cancel my 3pm', 'delete the dentist "
+        "appointment'. ALWAYS confirm with the user before cancelling — this "
+        "removes the event from their calendar."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "event_id": {
+                "type": "string",
+                "description": "The event's id, taken from a calendar.agenda result.",
+            },
+        },
+        "required": ["event_id"],
+    }
+    permission = "local"
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> str:
+        event_id = args.get("event_id")
+        if not isinstance(event_id, str) or not event_id.strip():
+            return "error: calendar.cancel requires an 'event_id' from calendar.agenda."
+
+        try:
+            service = build_service("calendar", "v3")
+        except GoogleAuthError as exc:
+            ctx.emit(_summary("calendar.cancel", str(exc), status="error"))
+            return str(exc)
+
+        try:
+            service.events().delete(
+                calendarId="primary", eventId=event_id.strip()
+            ).execute()
+        except Exception as exc:  # noqa: BLE001 — bad id or API failure
+            ctx.emit(_summary("calendar.cancel", type(exc).__name__, status="error"))
+            return f"error: Calendar cancel failed ({type(exc).__name__}): {exc}"
+
+        ctx.emit(_summary("calendar.cancel", "cancelled"))
+        return "Cancelled that event."
 
 
 def _summary(tool: str, detail: str, *, status: str = "ok") -> dict[str, Any]:

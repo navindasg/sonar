@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd LaunchAgent TEMPLATE for the Sonar voice loop (mic -> STT -> harness ->
+  TTS), owning the overlay port :8770.
+
+  Installed by `scripts/sonar.sh daemon install-voice` (OPT-IN, separate from the
+  harness) which substitutes __SONAR_SH__ and __LOGDIR__ and copies it to
+  ~/Library/LaunchAgents.
+
+  ! EXPERIMENTAL — needs a live acceptance test. The voice loop needs Microphone
+  and speaker access. macOS TCC (privacy) grants are attributed to the process
+  that first requests them; under launchd there is no foreground app to attribute
+  the prompt to, so the grant can be denied SILENTLY. If that happens, run
+  `scripts/sonar.sh voice` once from a real terminal to approve Microphone access,
+  then the launchd agent should inherit the grant. Auto-starting this also means
+  the mic is live from login — a deliberate "ambient assistant" choice, kept opt-in.
+
+  sonar.sh (`_exec-voice`) waits for Ollama + the harness, then frees :8770 from
+  the typed bridge (only one process can hold it) before exec'ing the voice loop.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sonar.voice</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__SONAR_SH__</string>
+        <string>_exec-voice</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__LOGDIR__/voice.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOGDIR__/voice.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

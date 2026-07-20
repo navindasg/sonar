@@ -33,6 +33,7 @@ dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
   "pytest-cov>=5.0",
+  "websockets>=13",   # notes/server.py round-trip tests (runtime dep of voice_loop)
 ]
 
 [project.scripts]

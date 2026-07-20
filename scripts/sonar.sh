@@ -12,10 +12,13 @@
 #   scripts/sonar.sh down          # stop both
 #   scripts/sonar.sh restart       # down, then up
 #   scripts/sonar.sh status        # ports, /health, models Ollama has resident
+#   scripts/sonar.sh doctor        # full preflight self-check (deps, models, health, OAuth) + fixes
+#   scripts/sonar.sh setup         # one-shot idempotent bring-up: start Ollama, pull models, daemons, then doctor
 #   scripts/sonar.sh logs          # tail -f both logs (Ctrl-C to stop tailing)
 #   scripts/sonar.sh ask "..."     # one-shot question against the running harness
 #   scripts/sonar.sh voice         # full voice loop (mic->STT->harness->TTS), foreground
 #   scripts/sonar.sh google-auth   # one-time browser consent for Gmail + Calendar (read-only)
+#   scripts/sonar.sh daemon <cmd>  # durable launchd agents: install | install-voice | uninstall | status
 #
 # Config (all optional, override via env):
 #   SONAR_HOME        state dir for logs/pids   (default ~/.sonar)
@@ -28,6 +31,13 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# launchd starts LaunchAgents with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin)
+# that omits ~/.local/bin (uv) and Homebrew, and it does NOT source your shell
+# profile. Prepend the usual locations so `uv`/`ollama` resolve identically
+# whether we're run from a login shell, an editor, or a launchd agent — this also
+# un-breaks the 08:00 morning-brief agent, which shells out to `uv` the same way.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 # Load config/.env early (gitignored: web-search provider/key, Google token paths,
 # any SONAR_* overrides) so its values feed both the ${VAR:-default} config below
@@ -47,6 +57,11 @@ OLLAMA_URL="${SONAR_OLLAMA_URL:-http://127.0.0.1:11434}"
 
 LOG_DIR="$SONAR_HOME/logs"
 RUN_DIR="$SONAR_HOME/run"
+
+# Absolute path to THIS script, for launchd plists. Must NOT be ${BASH_SOURCE[0]}
+# — that echoes however we were invoked (e.g. the relative "scripts/sonar.sh"),
+# and launchd runs agents from "/", where a relative path fails to resolve.
+SONAR_SH="$REPO_ROOT/scripts/sonar.sh"
 
 # --- helpers ----------------------------------------------------------------
 _port_up()  { lsof -ti "tcp:$1" >/dev/null 2>&1; }
@@ -82,6 +97,20 @@ _ensure_hammerspoon() {
   _remap_active || echo "overlay: ! F5->F13 remap not active — run scripts/hotkey/remap.sh (or use the ⌘⌃⌥G chord)"
 }
 
+# After the overlay's :$GLOW_PORT server (re)starts, Hammerspoon does NOT reliably
+# reconnect on its own — its WS heartbeat can stall, so the box goes dead whenever
+# :8770 changes hands (bridge <-> voice loop, or a KeepAlive respawn). Nudge it:
+# wait (in the background) for the server to bind, then reload the HS config so the
+# glow reconnects to whatever now owns :$GLOW_PORT. Backgrounded so callers can exec
+# the server right after; a no-op if Hammerspoon isn't installed.
+_reconnect_overlay() {
+  _hs_installed || return 0
+  ( i=0
+    while [ "$i" -lt 60 ]; do _port_up "$GLOW_PORT" && break; sleep 0.5; i=$((i+1)); done
+    sleep 1.5
+    _hs_running && hs -c 'hs.reload()' >/dev/null 2>&1 ) >/dev/null 2>&1 &
+}
+
 _wait_for() {  # _wait_for <label> <predicate-cmd...> — poll ~120s
   local label="$1"; shift
   local i
@@ -102,6 +131,44 @@ _preflight() {
   if [ ! -d "$VAULT_PATH" ]; then
     echo "error: vault not found at '${VAULT_PATH}' (set SONAR_VAULT_PATH)." >&2
     exit 1
+  fi
+}
+
+# Block until Ollama answers, or give up after ~90s so launchd's KeepAlive can
+# retry cleanly. Used by the launchd exec paths: the harness indexes the vault
+# through Ollama embeddings at startup and aborts if Ollama is down, so at login
+# we wait for it (Ollama's own app may still be coming up) instead of crash-looping.
+_await_ollama() {
+  local i
+  for i in $(seq 1 90); do
+    curl -sf "${OLLAMA_URL}/api/tags" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  echo "error: Ollama not reachable at ${OLLAMA_URL} after 90s — retrying." >&2
+  return 1
+}
+
+# launchd-agent lifecycle helpers (used by cmd_daemon). Templates live under
+# scripts/launchd/; __SONAR_SH__ must be the ABSOLUTE $SONAR_SH (launchd runs
+# agents from "/"), __LOGDIR__ the log dir.
+_install_agent() {  # <template-src> <installed-dst>
+  local la; la="$(dirname "$2")"; mkdir -p "$la"
+  sed -e "s|__SONAR_SH__|${SONAR_SH}|g" -e "s|__LOGDIR__|${LOG_DIR}|g" "$1" > "$2"
+  launchctl unload "$2" 2>/dev/null || true
+  launchctl load "$2"
+}
+_remove_agent() {  # <installed-dst>
+  [ -e "$1" ] || return 0
+  launchctl unload "$1" 2>/dev/null || true
+  rm -f "$1"
+}
+# Kill a manually-started (`sonar.sh up`) process still holding a port, so an
+# agent can bind it. <label> <port> <pidfile-name>
+_free_manual() {
+  if _port_up "$2"; then
+    echo "stopping manual $1 on :$2 (agent will take it) ..."
+    lsof -ti "tcp:$2" 2>/dev/null | xargs kill 2>/dev/null || true
+    rm -f "$RUN_DIR/$3"; sleep 1
   fi
 }
 
@@ -147,6 +214,7 @@ cmd_up() {
 
   # Overlay ------------------------------------------------------------------
   _ensure_hammerspoon
+  _reconnect_overlay   # bridge just (re)bound :8770 — make the glow reconnect to it
 
   echo
   cmd_status
@@ -161,14 +229,21 @@ cmd_up() {
 # permissions bind to the launching terminal, and you'll want to watch the
 # STT/TTS logs live. It serves the overlay on :$GLOW_PORT, so it takes that port
 # over from the typed bridge (stopped here if running). Ctrl-C returns you to the
-# typed bridge via `scripts/sonar.sh up`.
+# typed bridge via `scripts/sonar.sh daemon install` (or `up`).
 cmd_voice() {
   mkdir -p "$LOG_DIR" "$RUN_DIR"
   _preflight
   _start_harness
 
   # The typed bridge and the voice loop both serve the overlay on :$GLOW_PORT;
-  # only one can hold it. Hand the port to the voice loop.
+  # only one can hold it. If the durable bridge agent is installed, unload it —
+  # else KeepAlive would respawn it and fight the voice loop for the port.
+  local bagent="$HOME/Library/LaunchAgents/com.sonar.bridge.plist"
+  if [ -e "$bagent" ]; then
+    echo "unloading the bridge agent (voice takes over :${GLOW_PORT}) ..."
+    launchctl unload "$bagent" 2>/dev/null || true
+  fi
+  # Hand the port to the voice loop (kill any lingering typed bridge process).
   if _port_up "$GLOW_PORT"; then
     echo "freeing :${GLOW_PORT} (stopping typed bridge for the voice loop) ..."
     lsof -ti "tcp:$GLOW_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
@@ -181,10 +256,13 @@ cmd_voice() {
   echo "starting voice loop on :${GLOW_PORT} — press F5, speak, listen. Ctrl-C to stop."
   echo "(first run downloads STT + TTS models and prompts for Microphone access)"
   echo
+  _reconnect_overlay   # once the loop binds :8770, reconnect the glow to it
   # Foreground exec: inherits this terminal's TTY + mic/speaker TCC grants.
   cd "$REPO_ROOT/voice" && exec env \
     SONAR_HARNESS_URL="http://127.0.0.1:${HARNESS_PORT}" \
     SONAR_GLOW_PORT="$GLOW_PORT" \
+    SONAR_VAULT_PATH="$VAULT_PATH" \
+    SONAR_OLLAMA_URL="$OLLAMA_URL" \
     PYTHONUNBUFFERED=1 \
     uv run voice_loop.py
 }
@@ -231,6 +309,92 @@ cmd_logs() {
   tail -n 20 -f "$LOG_DIR/harness.log" "$LOG_DIR/bridge.log"
 }
 
+# Preflight self-check: verifies the whole stack (Ollama + required models,
+# harness + vault index, overlay backend, Google OAuth, web search, launchd
+# agents, formatter config) with a fix hint per line, and exits non-zero on a
+# hard failure. Deeper than `status`; safe to run anytime, and the check an
+# installer runs. Delegates to the harness module so it shares the server's
+# config + models.yaml source of truth.
+cmd_doctor() {
+  ( cd "$REPO_ROOT" && env \
+      SONAR_PORT="$HARNESS_PORT" \
+      SONAR_GLOW_PORT="$GLOW_PORT" \
+      SONAR_VAULT_PATH="$VAULT_PATH" \
+      SONAR_OLLAMA_URL="$OLLAMA_URL" \
+      uv run --project harness python -m sonar_harness.doctor "$@" )
+}
+
+# One-shot bring-up: get a fresh (or half-configured) machine to a ready stack.
+# IDEMPOTENT — skips whatever's already done, so it's safe to re-run and won't
+# disrupt an existing install. Does the Sonar-owned, safe steps automatically
+# (start Ollama, pull missing required models, install the durable daemons, start
+# SearXNG) and GUIDES the external/interactive ones (install uv/Ollama, set the
+# vault, Google consent). Ends with `doctor`. The required-model list comes from
+# the doctor (models.yaml) so it's never duplicated here.
+cmd_setup() {
+  echo "Sonar setup — bringing up the stack"; echo
+
+  # 1. Hard prerequisites we won't silently network-install for you.
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "  [✗] uv not found — install it, then re-run setup:"
+    echo "        curl -LsSf https://astral.sh/uv/install.sh | sh"; return 1
+  fi
+  if ! command -v ollama >/dev/null 2>&1; then
+    echo "  [✗] Ollama not found — install it (https://ollama.com), then re-run setup."; return 1
+  fi
+  echo "  [✓] uv + ollama on PATH"
+
+  # 2. Ollama daemon (start the app if it's installed but down).
+  if curl -sf "${OLLAMA_URL}/api/tags" >/dev/null 2>&1; then
+    echo "  [✓] Ollama already running (${OLLAMA_URL})"
+  else
+    echo "  [•] starting Ollama…"; open -a Ollama >/dev/null 2>&1 || (ollama serve >/dev/null 2>&1 &)
+    if _await_ollama; then echo "  [✓] Ollama up"; else
+      echo "  [✗] Ollama didn't come up — start it manually and re-run."; return 1; fi
+  fi
+
+  # 3. Required models (list sourced from the doctor / models.yaml).
+  local missing; missing="$(cd "$REPO_ROOT" && uv run --project harness python -m sonar_harness.doctor --missing-models 2>/dev/null || true)"
+  if [ -z "$missing" ]; then
+    echo "  [✓] all required models present"
+  else
+    echo "  [•] pulling missing models:"
+    while IFS= read -r m; do
+      [ -n "$m" ] || continue
+      echo "      ollama pull $m"; ollama pull "$m" || { echo "  [✗] pull failed for $m — re-run setup."; return 1; }
+    done <<< "$missing"
+    echo "  [✓] models pulled"
+  fi
+
+  # 4. Vault (can't create the user's vault; guide).
+  if [ -d "$VAULT_PATH" ]; then echo "  [✓] vault: $VAULT_PATH"
+  else echo "  [!] vault not found at '$VAULT_PATH' — set SONAR_VAULT_PATH (config/.env) to your Obsidian vault."; fi
+
+  # 5. Durable daemons — only if not already installed, so we don't swap an
+  #    existing topology (e.g. a voice install; bridge/voice share :$GLOW_PORT).
+  if launchctl list com.sonar.harness >/dev/null 2>&1; then
+    echo "  [✓] daemons already installed (com.sonar.harness loaded)"
+  else
+    echo "  [•] installing durable daemons…"; cmd_daemon install
+  fi
+
+  # 6. SearXNG (only when it's the selected search provider).
+  if [ "${SONAR_SEARCH_PROVIDER:-}" = "searxng" ]; then
+    if curl -sf "${SONAR_SEARXNG_URL:-http://127.0.0.1:8888}/config" >/dev/null 2>&1; then
+      echo "  [✓] SearXNG up"
+    else
+      echo "  [•] starting SearXNG…"; cmd_searxng up || echo "  [!] SearXNG didn't start — 'sonar.sh searxng up' to retry."
+    fi
+  fi
+
+  # 7. Google consent (interactive; guide, don't force).
+  local tok="${SONAR_GOOGLE_TOKEN:-${SONAR_CONFIG_DIR:-$HOME/.config/sonar}/google_token.json}"
+  if [ -f "$tok" ]; then echo "  [✓] Google connected"
+  else echo "  [!] Gmail/Calendar not connected (optional) — run: scripts/sonar.sh google-auth"; fi
+
+  echo; echo "── final check ────────────────────────────────"; cmd_doctor
+}
+
 cmd_ask() {
   local q="$*"
   [ -n "$q" ] || { echo "usage: sonar.sh ask <question>" >&2; exit 1; }
@@ -249,6 +413,153 @@ xs = r.get("x_sonar", {})
 print(r["choices"][0]["message"]["content"])
 print(f"\n[{dt:.1f}s · model={r.get('model')} · tool_calls={xs.get('tool_calls', 0)}]")
 PY
+}
+
+# Morning brief: fetch daily.brief from the harness, save a vault note, speak it
+# (if the voice loop is up). `run` does it once; `install`/`uninstall` manage the
+# 08:00 launchd schedule.
+cmd_brief() {
+  local action="${1:-run}"
+  local plist_src="$REPO_ROOT/scripts/launchd/com.sonar.morning-brief.plist"
+  local plist_dst="$HOME/Library/LaunchAgents/com.sonar.morning-brief.plist"
+  case "$action" in
+    run|"")
+      _port_up "$HARNESS_PORT" || { echo "harness not running — 'sonar.sh up' first." >&2; exit 1; }
+      cd "$REPO_ROOT" && exec env \
+        SONAR_HARNESS_URL="http://127.0.0.1:${HARNESS_PORT}" \
+        SONAR_GLOW_PORT="$GLOW_PORT" \
+        SONAR_VAULT_PATH="$VAULT_PATH" \
+        PYTHONUNBUFFERED=1 \
+        uv run scripts/morning_brief.py
+      ;;
+    install)
+      mkdir -p "$LOG_DIR" "$HOME/Library/LaunchAgents"
+      sed -e "s|__SONAR_SH__|${SONAR_SH}|g" -e "s|__LOGDIR__|${LOG_DIR}|g" \
+        "$plist_src" > "$plist_dst"
+      launchctl unload "$plist_dst" 2>/dev/null || true
+      launchctl load "$plist_dst"
+      echo "morning brief scheduled daily at 08:00 (com.sonar.morning-brief)."
+      echo "  plist: $plist_dst"
+      echo "  note: keep the harness (+ voice loop for audio) running at 08:00."
+      ;;
+    uninstall)
+      launchctl unload "$plist_dst" 2>/dev/null || true
+      rm -f "$plist_dst"
+      echo "morning brief schedule removed."
+      ;;
+    *) echo "usage: sonar.sh brief [run|install|uninstall]" >&2; exit 1 ;;
+  esac
+}
+
+# launchd entrypoint (hidden): run the harness in the FOREGROUND so launchd is its
+# parent and KeepAlive can supervise it. No _spawn/nohup here — detaching would
+# defeat launchd's supervision. Waits for Ollama first (see _await_ollama).
+cmd_exec_harness() {
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  [ -d "$VAULT_PATH" ] || { echo "error: vault not found at '${VAULT_PATH}'." >&2; exit 1; }
+  _await_ollama || exit 1
+  cd "$REPO_ROOT" && exec env \
+    SONAR_PORT="$HARNESS_PORT" \
+    SONAR_VAULT_PATH="$VAULT_PATH" \
+    SONAR_VAULT_NAME="$VAULT_NAME" \
+    SONAR_OLLAMA_URL="$OLLAMA_URL" \
+    PYTHONUNBUFFERED=1 \
+    uv run --project harness python -u -m sonar_harness
+}
+
+# launchd entrypoint (hidden) for the overlay bridge (WS :$GLOW_PORT; the
+# Hammerspoon glow is the client and reconnects on its own). Waits for the
+# harness it proxies to, then execs the bridge in the foreground so launchd's
+# KeepAlive can supervise it. Mutually exclusive with the voice loop on :$GLOW_PORT.
+cmd_exec_bridge() {
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  _wait_for "harness /health" _health || exit 1
+  _reconnect_overlay   # bridge is (re)starting on :8770 — reconnect the glow to it
+  cd "$REPO_ROOT" && exec env \
+    SONAR_HARNESS_URL="http://127.0.0.1:${HARNESS_PORT}" \
+    SONAR_GLOW_PORT="$GLOW_PORT" \
+    PYTHONUNBUFFERED=1 \
+    uv run overlay/bridge.py
+}
+
+# launchd entrypoint (hidden) for the voice loop. Waits for Ollama + the harness,
+# then frees :$GLOW_PORT from the typed bridge (only one can hold it) and execs
+# the loop in the foreground. Mic/TCC under launchd is EXPERIMENTAL — see the
+# plist comment and `daemon install-voice`.
+cmd_exec_voice() {
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  _await_ollama || exit 1
+  _wait_for "harness /health" _health || exit 1
+  if _port_up "$GLOW_PORT"; then
+    lsof -ti "tcp:$GLOW_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
+    rm -f "$RUN_DIR/bridge.pid"
+    _wait_for ":${GLOW_PORT} free" bash -c "! lsof -ti tcp:${GLOW_PORT} >/dev/null 2>&1" || true
+  fi
+  _reconnect_overlay   # once the loop binds :8770, reconnect the glow to it
+  cd "$REPO_ROOT/voice" && exec env \
+    SONAR_HARNESS_URL="http://127.0.0.1:${HARNESS_PORT}" \
+    SONAR_GLOW_PORT="$GLOW_PORT" \
+    SONAR_VAULT_PATH="$VAULT_PATH" \
+    SONAR_OLLAMA_URL="$OLLAMA_URL" \
+    PYTHONUNBUFFERED=1 \
+    uv run voice_loop.py
+}
+
+# Durable launchd LaunchAgents (RunAtLoad + KeepAlive): the harness — and, opt-in,
+# the voice loop — start at login and respawn on crash. This is the fix for
+# "the services died between sessions, so the 08:00 brief couldn't fire", and the
+# first real step toward the packaged, always-on app.
+cmd_daemon() {
+  local action="${1:-status}"
+  local la="$HOME/Library/LaunchAgents"
+  local hsrc="$REPO_ROOT/scripts/launchd/com.sonar.harness.plist"
+  local bsrc="$REPO_ROOT/scripts/launchd/com.sonar.bridge.plist"
+  local vsrc="$REPO_ROOT/scripts/launchd/com.sonar.voice.plist"
+  local hdst="$la/com.sonar.harness.plist"
+  local bdst="$la/com.sonar.bridge.plist"
+  local vdst="$la/com.sonar.voice.plist"
+  case "$action" in
+    install)
+      # The durable typed-overlay stack: harness (+ RAG/tools) and the bridge that
+      # backs the F5 box. Bridge and voice both bind :$GLOW_PORT, so drop any voice
+      # agent first — they're mutually exclusive.
+      mkdir -p "$LOG_DIR" "$RUN_DIR" "$la"
+      if [ -e "$vdst" ]; then echo "removing voice agent (bridge owns :${GLOW_PORT}) ..."; _remove_agent "$vdst"; fi
+      _free_manual harness "$HARNESS_PORT" harness.pid
+      _free_manual bridge  "$GLOW_PORT"    bridge.pid
+      _install_agent "$hsrc" "$hdst"
+      echo "harness daemon installed (com.sonar.harness) — RunAtLoad + KeepAlive."
+      if _wait_for "harness /health" _health; then echo "  harness up on :${HARNESS_PORT}."; else echo "  ! not healthy yet — check $LOG_DIR/harness.err.log"; fi
+      _install_agent "$bsrc" "$bdst"
+      echo "bridge daemon installed (com.sonar.bridge) — RunAtLoad + KeepAlive."
+      if _wait_for "bridge :${GLOW_PORT}" _port_up "$GLOW_PORT"; then echo "  bridge up on :${GLOW_PORT} — F5 overlay should work."; else echo "  ! bridge not up — check $LOG_DIR/bridge.err.log"; fi
+      _ensure_hammerspoon
+      echo
+      echo "Voice loop is opt-in (swaps the bridge off :${GLOW_PORT}; mic/TCC under launchd needs a live check):"
+      echo "  scripts/sonar.sh daemon install-voice"
+      ;;
+    install-voice)
+      # Voice owns :$GLOW_PORT — drop the bridge agent (and any manual bridge) first.
+      mkdir -p "$LOG_DIR" "$RUN_DIR" "$la"
+      if [ -e "$bdst" ]; then echo "removing bridge agent (voice owns :${GLOW_PORT}) ..."; _remove_agent "$bdst"; fi
+      _free_manual bridge "$GLOW_PORT" bridge.pid
+      _install_agent "$vsrc" "$vdst"
+      echo "voice daemon installed (com.sonar.voice) — RunAtLoad + KeepAlive."
+      echo "  ! EXPERIMENTAL: if macOS denies mic access under launchd (no prompt appears),"
+      echo "    run 'scripts/sonar.sh voice' once from a terminal to grant Microphone, then"
+      echo "    the agent should inherit it. Watch:  tail -f $LOG_DIR/voice.err.log"
+      ;;
+    uninstall)
+      _remove_agent "$hdst"; _remove_agent "$bdst"; _remove_agent "$vdst"
+      echo "harness + bridge + voice daemons removed. (Use 'scripts/sonar.sh up' for a manual stack.)"
+      ;;
+    status)
+      local found; found="$(launchctl list 2>/dev/null | grep -E 'com\.sonar' || true)"
+      if [ -n "$found" ]; then echo "$found"; else echo "no com.sonar agents loaded."; fi
+      echo; cmd_status
+      ;;
+    *) echo "usage: sonar.sh daemon [install|install-voice|uninstall|status]" >&2; exit 1 ;;
+  esac
 }
 
 # Self-hosted SearXNG for the web.search tool (private metasearch, no vendor key).
@@ -272,15 +583,22 @@ main() {
     down)    cmd_down ;;
     restart) cmd_down; echo; cmd_up ;;
     status)  cmd_status ;;
+    doctor)  cmd_doctor "$@" ;;
+    setup)   cmd_setup ;;
     logs)    cmd_logs ;;
     ask)         cmd_ask "$@" ;;
     voice)       cmd_voice ;;
     google-auth) cmd_google_auth ;;
     searxng)     cmd_searxng "$@" ;;
+    brief)       cmd_brief "$@" ;;
+    daemon)      cmd_daemon "$@" ;;
+    _exec-harness) cmd_exec_harness ;;   # hidden: launchd entrypoints (see plists)
+    _exec-bridge)  cmd_exec_bridge ;;
+    _exec-voice)   cmd_exec_voice ;;
     ""|-h|--help|help)
-      sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+      sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
     *)
-      echo "unknown command: $sub (try: up | down | restart | status | logs | ask | voice | google-auth | searxng)" >&2
+      echo "unknown command: $sub (try: up | down | restart | status | doctor | setup | logs | ask | voice | google-auth | searxng | brief | daemon)" >&2
       exit 1 ;;
   esac
 }

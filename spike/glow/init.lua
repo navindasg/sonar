@@ -12,7 +12,6 @@ local WS_HOST = os.getenv("SONAR_GLOW_HOST") or "127.0.0.1"
 local WS_PORT = os.getenv("SONAR_GLOW_PORT") or "8770"
 local WS_URL  = "ws://" .. WS_HOST .. ":" .. WS_PORT
 local FPS     = 30
-local RECONNECT_AFTER = 2.0
 
 -- Overall glow opacity per state — NO colour change, just how deep the cave is.
 local INTENSITY = { idle = 0.16, listening = 0.92, thinking = 0.96, speaking = 1.0 }
@@ -29,8 +28,9 @@ local TEXTURE = scriptDir() .. "vignette.png"
 local M = {
   canvases = {}, ws = nil, animTimer = nil, screenWatcher = nil,
   phase = 0.0, visible = false, state = "idle", level = 0.0,
-  reconnecting = false, wsOpen = false, texture = nil,
+  wsGen = 0, wsOpen = false, texture = nil,
   bar = nil, barUCC = nil, lastTyped = nil, committed = "",
+  summoned = false, summonHideTimer = nil,
 }
 M.texture = hs.image.imageFromPath(TEXTURE)
 
@@ -242,8 +242,18 @@ function M.resizeBar(h)
   M.bar:frame(hs.geometry.rect(f.x, f.y, BAR_W, target))
 end
 
+-- A summoned box (proactive push, e.g. the morning brief) auto-hides after a
+-- linger UNLESS the user takes it over — opens/closes the overlay, or types into
+-- it. Any of those calls this to cancel the pending auto-hide and forget it was
+-- a push, so the box behaves like a normal user session from then on.
+function M.clearSummon()
+  M.summoned = false
+  if M.summonHideTimer then M.summonHideTimer:stop(); M.summonHideTimer = nil end
+end
+
 -- Send a typed question to the bridge, which runs it through the harness.
 function M.sendText(t)
+  M.clearSummon()   -- typing means the user has taken the box over
   if M.ws and M.wsOpen then
     pcall(function() M.ws:send(hs.json.encode({ text = t })) end)
   else
@@ -273,17 +283,20 @@ end
 
 -- ============================================================ websocket
 local connect
-local function scheduleReconnect()
-  if M.reconnecting then return end
-  M.reconnecting = true
-  hs.timer.doAfter(RECONNECT_AFTER, function() M.reconnecting = false; connect() end)
-end
+-- Reconnect is driven by the heartbeat in start(), which checks the socket's REAL
+-- status(). A server killed abruptly (bridge <-> voice swap, KeepAlive respawn)
+-- often never delivers a "closed"/"fail" callback, so the old cached-flag logic
+-- left M.wsOpen stale-true and never retried. Each connect() bumps M.wsGen so a
+-- late event from a superseded socket can't clobber the current one.
 connect = function()
-  -- Close any prior socket first so reloads/heartbeats don't pile up stale
-  -- connections on the bridge (each would double-drive the mic).
+  M.wsGen = (M.wsGen or 0) + 1
+  local gen = M.wsGen
+  -- Close any prior socket first so reconnects don't pile up stale connections
+  -- on the server (each would double-drive the mic).
   if M.ws then pcall(function() M.ws:close() end); M.ws = nil; M.wsOpen = false end
   local ok, ws = pcall(hs.websocket.new, WS_URL, function(status, message)
-    if status == "open" then M.reconnecting = false; M.wsOpen = true
+    if gen ~= M.wsGen then return end   -- stale socket: ignore its late events
+    if status == "open" then M.wsOpen = true
     elseif status == "received" then
       M.rxCount = (M.rxCount or 0) + 1
       M.lastRx = message
@@ -291,6 +304,7 @@ connect = function()
       if okd and type(data) == "table" then
         if data.state then M.state = data.state end
         M.level = tonumber(data.level) or M.level
+        if data.summon then M.summonBox(data.text) end
         if data.transcript ~= nil then
           M.rxTranscript = data.transcript
           M.onTranscript(data.transcript, data.partial == true)
@@ -303,15 +317,16 @@ connect = function()
         elseif data.turn == "end" then
           M.evalBar("window.sonar && sonar.setBusy(false)")
           M.turnDone = true   -- next utterance clears the box (see M.onTranscript)
+          if M.summoned then M.scheduleSummonHide() end
         end
       else
         print("[sonar-rx] decode failed: " .. tostring(message))
       end
     elseif status == "closed" or status == "fail" then
-      M.ws = nil; M.wsOpen = false; scheduleReconnect()
+      M.wsOpen = false   -- connect() owns M.ws; don't null a possibly-newer socket
     end
   end)
-  if ok then M.ws = ws else scheduleReconnect() end
+  if ok then M.ws = ws else M.ws = nil; M.wsOpen = false end
 end
 
 -- ============================================================ summon + wiring
@@ -321,6 +336,7 @@ local function sendCmd(cmd)
 end
 local function showOverlay()
   if M.visible then return end
+  M.clearSummon()    -- a real F5 press: this is now a user session, not a push
   M.committed = ""   -- fresh transcript each time the box opens
   M.visible = true; M.state = "listening"; render(); showAll(); M.showBar()
   hs.timer.doAfter(0.16, function() M.evalBar("window.sonar && sonar.clearTurn()") end)
@@ -328,11 +344,45 @@ local function showOverlay()
 end
 local function hideOverlay()
   if not M.visible then return end
+  M.clearSummon()    -- dismissing (F5 or auto-hide): stop tracking it as a push
   M.visible = false; hideAll(); M.hideBar()
   sendCmd("stop")    -- tell the STT bridge to stop listening
 end
 local function toggleOverlay()
   if M.visible then hideOverlay() else showOverlay() end
+end
+
+-- ---- proactive push (summon) --------------------------------------------------
+-- The morning brief speaks on its OWN short-lived connection, so the glow that
+-- draws the box is a different client. The voice loop broadcasts {summon, text}
+-- to every client; here we reveal the (normally F5-gated) box and show the whole
+-- message at once — WITHOUT opening the mic (no sendCmd("start")).
+local SUMMON_LINGER_S = tonumber(os.getenv("SONAR_SUMMON_LINGER_S") or "") or 30
+function M.summonBox(text)
+  if M.summonHideTimer then M.summonHideTimer:stop(); M.summonHideTimer = nil end
+  M.summoned = true
+  M.committed = ""
+  M.visible = true; M.state = "speaking"; render(); showAll(); M.showBar()
+  -- One deferred callback (the freshly-(re)built webview needs a beat to load):
+  -- clear THEN set the text together, so no stray clearTurn can wipe it — the
+  -- clear-race that showOverlay's own delayed clearTurn would otherwise cause.
+  local msg = text or ""
+  hs.timer.doAfter(0.16, function()
+    M.evalBar("window.sonar && sonar.clearTurn(); window.sonar && sonar.setBusy(true)")
+    if msg ~= "" then
+      M.evalBar(("window.sonar && sonar.appendAnswer('%s')"):format(jsEsc(msg)))
+    end
+  end)
+end
+
+-- Once the brief finishes speaking (turn:end), keep the box up for a linger so it
+-- can be read, then hide it — but only if the user never took it over.
+function M.scheduleSummonHide()
+  if M.summonHideTimer then M.summonHideTimer:stop() end
+  M.summonHideTimer = hs.timer.doAfter(SUMMON_LINGER_S, function()
+    M.summonHideTimer = nil
+    if M.summoned then hideOverlay() end
+  end)
 end
 
 local function start()
@@ -350,10 +400,14 @@ local function start()
     if M.visible then render() end
   end)
   connect()
-  -- Heartbeat: if the socket isn't open, reconnect. Survives the STT bridge
-  -- restarting without needing a manual hs.reload().
-  M.heartbeat = hs.timer.doEvery(3, function()
-    if not M.wsOpen and not M.reconnecting then connect() end
+  -- Heartbeat: reconnect whenever the socket isn't actually open. We query the
+  -- socket's REAL status() rather than the cached M.wsOpen flag, because a server
+  -- killed abruptly may never fire a close callback — the flag would stay stale-
+  -- true and we'd never reconnect. On localhost a dead port fails fast, so this
+  -- re-links the glow within ~2s of a bridge<->voice swap or a KeepAlive respawn.
+  M.heartbeat = hs.timer.doEvery(2, function()
+    local st = (M.ws and M.ws:status()) or "closed"
+    if st ~= "open" and st ~= "connecting" then connect() end
   end)
   -- Toggle on F13 (the remapped F5): press to show, press again to hide.
   hs.hotkey.bind({}, "f13", toggleOverlay)

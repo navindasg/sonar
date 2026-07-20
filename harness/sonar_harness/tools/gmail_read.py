@@ -49,7 +49,15 @@ class GmailSearchTool(ToolBase):
         "sender, subject, date, and a snippet. Use Gmail search operators in "
         "'query' — e.g. 'is:unread', 'from:alice newer_than:2d', "
         "'subject:invoice', 'in:inbox is:important'. Leave query empty for the "
-        "most recent inbox mail. Cannot send or draft email."
+        "most recent inbox mail. "
+        "Start BROAD, narrow only if needed: prefer a sender plus one or two bare "
+        "keywords (from:alice alias) over a long guess. Keywords match whole words "
+        "across sender, subject, and body and are AND-ed, so every extra word can "
+        "only shrink the results. Do NOT wrap the user's paraphrase in quotes — "
+        "quotes force an exact-phrase match and usually return nothing; only quote "
+        "text the user quoted literally. If a search returns no messages, broaden "
+        "and try again (drop words, drop quotes, or search from:<name> alone) "
+        "before telling the user there's nothing. Cannot send or draft email."
     )
     input_schema = {
         "type": "object",

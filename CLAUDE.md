@@ -20,6 +20,13 @@ SearXNG for web.search), `scripts/sonar.sh` (launcher).
 - Audio / on-machine behavior (voice loop, overlay) is Navin's to acceptance-test:
   code-verify it, ship it, and flag what needs a live check — don't block the push
   on the manual test.
+- **Relaunch the daemon after any change.** The harness/bridge/voice run as durable
+  launchd agents (`com.sonar.*`) that load code at process start, so a change isn't
+  live until the affected daemon is relaunched. Once a change is done, redeploy it:
+  `scripts/sonar.sh daemon install` (harness + bridge) or `daemon install-voice`
+  (voice); for `spike/glow/init.lua` overlay edits, `hs -c 'hs.reload()'`. Verify it
+  came back up (`daemon status` / `/health` / overlay reconnected) — don't leave a
+  verified change running against stale code.
 
 ## Run / verify
 

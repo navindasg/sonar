@@ -36,6 +36,7 @@ from sonar_harness.events import EventSink
 from sonar_harness.model_router import load_config as load_models_config
 from sonar_harness.ollama_client import DEFAULT_OLLAMA_URL, OllamaChat
 from sonar_harness.prompt import load_charter
+from sonar_harness.scheduler import start_scheduler
 from sonar_harness.state import State
 from sonar_harness.tools import ToolRegistry, default_tools
 from sonar_harness.tools.rag_backend import InProcessRagBackend
@@ -95,9 +96,14 @@ async def lifespan(app: FastAPI):
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     _build_state(app)
+    app.state.scheduler = start_scheduler(
+        vault_path=os.environ.get("SONAR_VAULT_PATH", str(DEFAULT_VAULT))
+    )
     try:
         yield
     finally:
+        if app.state.scheduler is not None:
+            app.state.scheduler.stop()
         app.state.ollama.close()
         app.state.state.close()
 

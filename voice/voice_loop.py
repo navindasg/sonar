@@ -13,6 +13,7 @@
 #   "sounddevice>=0.4",        # mic in + speaker out (not in osvoice pyproject)
 #   "websockets>=13",
 #   "httpx>=0.27",
+#   "speechbrain>=1.0",        # ECAPA speaker embeddings for notes diarization
 # ]
 # ///
 """Sonar voice loop (I0) — press F5, speak, hear a vault-grounded answer.
@@ -55,6 +56,7 @@ import contextlib
 import json
 import logging
 import os
+import random
 import sys
 from collections import deque
 from typing import Any, AsyncIterator
@@ -72,14 +74,23 @@ from osvoice.vad import Endpointer, VadEvent  # noqa: E402
 
 from audio_io import OutputPlayer, rms_pcm16  # noqa: E402
 from echo_gate import EchoGate  # noqa: E402
+from acks import next_ack  # noqa: E402
 from harness_client import DELTA, STEP, stream_turn  # noqa: E402
 from history import append_turn  # noqa: E402
+from notes import session as notes_session  # noqa: E402
+from notes.controller import NotesController  # noqa: E402
+from notes.intent import notes_title_hint, wants_notes_start  # noqa: E402
 
 log = logging.getLogger("sonar.voice")
 
 HOST = os.environ.get("SONAR_GLOW_HOST", "127.0.0.1")
 PORT = int(os.environ.get("SONAR_GLOW_PORT", "8770"))
 HARNESS_URL = os.environ.get("SONAR_HARNESS_URL", "http://127.0.0.1:8787").rstrip("/")
+OLLAMA_URL = os.environ.get("SONAR_OLLAMA_URL", "http://127.0.0.1:11434")
+VAULT_PATH = os.environ.get(
+    "SONAR_VAULT_PATH", os.path.expanduser("~/Documents/Obsidian Vault")
+)
+NOTES_PORT = int(os.environ.get("SONAR_NOTES_PORT", "8771"))
 
 SAMPLE_RATE = 16_000
 FRAME = 512                          # Silero window @16 kHz (32 ms)
@@ -90,8 +101,10 @@ MIN_UTTER_SAMPLES = SAMPLE_RATE // 5  # ignore <200 ms slivers (too short for pa
 PREROLL_FRAMES = 8                   # ~256 ms of pre-speech kept for lead-in
 
 # Short spoken ack the instant a turn starts, to cover the harness's blocking
-# tool loop (~8 s on tool turns) so voice turns never open with dead air.
-ACK_TEXT = os.environ.get("SONAR_VOICE_ACK", "One sec.")
+# tool loop (~8 s on tool turns) so voice turns never open with dead air. Rotated
+# per turn (see acks.py) so it isn't the same phrase every time; set SONAR_VOICE_ACK
+# to force one fixed phrase instead.
+ACK_TEXT = os.environ.get("SONAR_VOICE_ACK", "").strip()
 DUCK_GAIN = float(os.environ.get("SONAR_VOICE_DUCK_GAIN", "0.35"))
 
 # Conversation memory within one F5 session: prior turns ride along so follow-ups
@@ -125,6 +138,11 @@ class VoiceLoop:
         self.speaking = False
         self._response_task: asyncio.Task[None] | None = None
         self.history: list[dict[str, str]] = []  # session memory (bounded)
+        self._ack_rng = random.Random()          # rotate acks; avoid back-to-back repeats
+        self._last_ack: str | None = None
+        self.notes: NotesController | None = None  # built in load()
+        self._notes_ws: Any | None = None          # overlay conn that started notes
+        self.clients: set[Any] = set()             # every connected overlay/poker WS
 
     async def load(self) -> None:
         print("[voice] loading parakeet STT (first run downloads ~1-2GB)…", flush=True)
@@ -145,12 +163,24 @@ class VoiceLoop:
         import httpx
 
         self.harness = httpx.AsyncClient(base_url=HARNESS_URL)
+        self.notes = NotesController(
+            # The notes path gets the RAISING variant so a real STT failure can
+            # surface as a toast instead of looking like silence (the assistant
+            # path keeps _transcribe_pcm, which drops a bad utterance).
+            transcribe=self._stt_text,
+            vault_path=VAULT_PATH,
+            ollama_url=OLLAMA_URL,
+            port=NOTES_PORT,
+            on_ended=self._on_notes_done,
+        )
         print(f"[voice] ready — harness {HARNESS_URL}", flush=True)
 
     async def aclose(self) -> None:
         await self._cancel_response()
         self.stop_mic()
         self.player.stop()
+        if self.notes is not None:
+            await self.notes.aclose()
         if self.harness is not None:
             await self.harness.aclose()
 
@@ -190,6 +220,7 @@ class VoiceLoop:
     # ---- connection handling ----
     async def handler(self, ws) -> None:
         print("[voice] overlay connected", flush=True)
+        self.clients.add(ws)
         self.loop = asyncio.get_running_loop()
         consumer = asyncio.create_task(self._consume(ws))
         try:
@@ -200,7 +231,25 @@ class VoiceLoop:
                     continue
                 text = msg.get("text")
                 cmd = msg.get("cmd")
-                if isinstance(text, str) and text.strip():
+                if cmd == "say" and isinstance(text, str) and text.strip():
+                    # Proactive push (e.g. the scheduled morning brief): speak the
+                    # given text directly — NO harness turn. Checked before the
+                    # typed path so its 'text' isn't treated as a question.
+                    if self._notes_recording():
+                        # Never play TTS into a live meeting — the hot mic would
+                        # transcribe it as a phantom speaker. Drop the push.
+                        log.info("suppressing proactive say during a notes session")
+                        continue
+                    self._start_say(ws, text.strip())
+                elif isinstance(text, str) and text.strip():
+                    if self._maybe_start_notes(ws, text.strip()):
+                        continue  # typed "take notes" starts a session, not a turn
+                    if self._notes_recording():
+                        # A live meeting owns the audio; a harness turn here would
+                        # speak TTS into it. Drop the typed turn (End from the
+                        # notes page when the meeting's done).
+                        log.info("suppressing typed turn during a notes session")
+                        continue
                     self._start_response(ws, text.strip())  # typed -> harness + TTS
                 elif cmd == "start":
                     self.listening = True
@@ -212,14 +261,25 @@ class VoiceLoop:
                     # Second F5 / overlay close: stop EVERYTHING now — mic off,
                     # turn cancelled, and any audio still queued is flushed so the
                     # reply doesn't keep playing after you've dismissed it.
+                    # EXCEPT the mic while a notes session records: closing the
+                    # overlay must not kill an in-flight meeting transcript.
                     self.listening = False
-                    self.stop_mic()
+                    if not self._notes_recording():
+                        self.stop_mic()
                     await self._silence()
                     await self._send(ws, {"state": "idle", "level": 0.0})
                     print("[voice] stopped", flush=True)
         finally:
+            self.clients.discard(ws)
             consumer.cancel()
             self.listening = False
+            # Tearing the connection down cancels _consume — the ONLY thing
+            # draining self.frames. Leaving the mic hot now (even to protect a
+            # live notes session) just fills the queue unbounded and freezes the
+            # transcript, so ALWAYS stop it. The notes page is a separate tab
+            # that stays up, so the user can still End from there.
+            if self._notes_recording():
+                log.warning("overlay disconnected mid-notes — stopping the now-consumerless mic (End from the notes page)")
             self.stop_mic()
             await self._silence()  # dropped socket: don't keep talking to a gone overlay
 
@@ -232,7 +292,12 @@ class VoiceLoop:
         ticks = 0
         since_partial = 0
         while True:
-            if not self.listening or self.frames is None:
+            notes_live = self._notes_recording()
+            notes_active = self._notes_active()
+            # Stay in the loop through the summarize gap too (notes_active), so
+            # the mic is drained (frames dropped) instead of piling up unconsumed
+            # while the overlay is closed and end() awaits the AI overview.
+            if (not self.listening and not notes_active) or self.frames is None:
                 capturing = False
                 utterance.clear()
                 preroll.clear()
@@ -249,6 +314,23 @@ class VoiceLoop:
                 ticks += 1
                 vad = self._silero_prob(frame)
                 level = rms_pcm16(frame)
+
+                if notes_active:
+                    # Notes owns the mic: frames feed the diarized transcript,
+                    # never the assistant. Keep the assistant's capture state
+                    # clean and the glow breathing. Two guards on the actual feed:
+                    #  - not while SUMMARIZING (notes_live is False then): the mic
+                    #    is still hot but the session is closing — just drop, so a
+                    #    stray utterance can't leak into the assistant path.
+                    #  - not while Sonar is speaking: TTS bleeding into a hot mic
+                    #    would be transcribed as a phantom speaker.
+                    capturing = False
+                    utterance = []
+                    if notes_live and not self.speaking:
+                        self.notes.feed(frame, vad)
+                    if ticks % 3 == 0:
+                        await self._send(ws, {"state": "listening", "level": level})
+                    continue
 
                 if self.speaking:
                     if await self._barge_check(ws, vad, level, preroll):
@@ -284,7 +366,7 @@ class VoiceLoop:
                     capturing = False
                     turn, utterance = utterance, []
                     text = await self._emit_transcript(ws, turn, final=True)
-                    if text.strip():
+                    if text.strip() and not self._maybe_start_notes(ws, text.strip()):
                         self._start_response(ws, text.strip())
 
     async def _barge_check(
@@ -317,12 +399,84 @@ class VoiceLoop:
         await self._send(ws, {"answer": "", "partial": False})
         await self._send(ws, {"state": "listening", "level": 0.2})
 
+    # ---- notes mode (diarized note taker; see notes/) ----
+    def _notes_recording(self) -> bool:
+        """True while a notes session exists and hasn't been ended."""
+        return self.notes is not None and self.notes.recording
+
+    def _notes_active(self) -> bool:
+        """True while a notes session owns the mic — recording OR summarizing.
+
+        Broader than _notes_recording: after end() flips to SUMMARIZING the mic
+        is still hot, and its frames must be kept out of the assistant path (a
+        spurious harness turn) until on_ended hands the mic back.
+        """
+        return self.notes is not None and self.notes.active
+
+    def _maybe_start_notes(self, ws, text: str) -> bool:
+        """Start a notes session iff ``text`` is the 'take notes' command."""
+        if self.notes is None or self._notes_recording() or not wants_notes_start(text):
+            return False
+        if self._response_task is not None and not self._response_task.done():
+            self._response_task.cancel()
+        self._response_task = asyncio.create_task(self._start_notes(ws, text))
+        return True
+
+    async def _start_notes(self, ws, trigger_text: str) -> None:
+        """Bring up the notes UI, say so, then open the mic tap.
+
+        Ordering matters: capture begins only AFTER the spoken ack has fully
+        played, so Sonar's own voice can never leak into the transcript as a
+        phantom speaker.
+        """
+        self._notes_ws = ws
+        try:
+            url = await self.notes.start(title_hint=notes_title_hint(trigger_text))
+            print(f"[voice] notes session — UI at {url}", flush=True)
+            # Don't tell the user to say a stop phrase: spoken stop is unreliable
+            # (STT rarely hears "stop taking notes" cleanly), so the notes window's
+            # End button is the real control. Just point them there.
+            await self._speak_text(
+                ws, "Taking notes. Hit end in the notes window when you're done."
+            )
+            self.start_mic()  # normally already hot; harmless if so
+            self.notes.begin_capture()
+        except asyncio.CancelledError:
+            # F5 cutoff mid-startup: don't leave a half-open session behind.
+            with contextlib.suppress(Exception):
+                await self.notes.discard()
+            raise
+        except Exception as exc:  # noqa: BLE001 — a failed launch must say so
+            log.exception("notes session failed to start")
+            with contextlib.suppress(Exception):
+                await self.notes.discard()
+            await self._speak_text(ws, f"Sorry, I couldn't open the notes window. {exc}")
+
+    async def _on_notes_done(self) -> None:
+        """Notes session left recording (ended or discarded): hand the mic back."""
+        if not self.listening:
+            self.stop_mic()  # overlay is closed; don't leave the mic hot
+        self.endpointer.reset()
+        if self.silero is not None:
+            self.silero.reset_states()
+        state = self.notes.state if self.notes is not None else None
+        if state is not None and state.status == notes_session.REVIEW:
+            self._start_say(
+                self._notes_ws, "Done taking notes. Review and save them in the notes window."
+            )
+
     # ---- response: harness turn -> box + TTS ----
     def _start_response(self, ws, text: str) -> None:
         """(Re)start the response task for ``text``; a new turn replaces any old."""
         if self._response_task is not None and not self._response_task.done():
             self._response_task.cancel()
         self._response_task = asyncio.create_task(self._respond(ws, text))
+
+    def _start_say(self, ws, text: str) -> None:
+        """Start a proactive spoken message, replacing any in-flight turn."""
+        if self._response_task is not None and not self._response_task.done():
+            self._response_task.cancel()
+        self._response_task = asyncio.create_task(self._speak_text(ws, text))
 
     async def _cancel_response(self) -> None:
         task = self._response_task
@@ -361,7 +515,10 @@ class VoiceLoop:
         delta_q: asyncio.Queue[str | None] = asyncio.Queue()
         pump = asyncio.create_task(self._pump(ws, messages, delta_q))
         try:
-            await self._speak_clause(ACK_TEXT)  # covers the blocking tool loop
+            # Rotate the ack so it isn't "One sec." every turn (env forces a fixed one).
+            ack = ACK_TEXT or next_ack(self._last_ack, self._ack_rng)
+            self._last_ack = ack
+            await self._speak_clause(ack)  # covers the blocking tool loop
             async for clause in aggregate(self._drain_deltas(delta_q)):
                 await self._speak_clause(clause)
             answer = await pump
@@ -377,6 +534,37 @@ class VoiceLoop:
             await self._send(ws, {"turn": "end"})
             await self._send(ws, {"state": "listening", "level": 0.2})
             self.speaking = False
+
+    async def _speak_text(self, ws, text: str) -> None:
+        """Speak already-composed text with NO harness turn (a proactive push, e.g.
+        the scheduled morning brief). Summons the overlay box to show the full text
+        and streams it to Kokoro clause by clause. Cancellable like a normal turn,
+        so an F5 cutoff (``_silence``) silences it too.
+
+        The display events BROADCAST to every connected client, not just ``ws``: a
+        proactive push arrives on its own short-lived connection (morning_brief.py),
+        so the glow that actually draws the box is a DIFFERENT client — sending only
+        to the poker left the box empty (the v1 caveat this fixes). The ``summon``
+        flag tells the glow to reveal its (normally hidden) box and show ``text``.
+        """
+        self.speaking = True
+        self.gate.reset()
+        self.player.set_gain(1.0)
+        await self._broadcast({"turn": "start"})
+        await self._broadcast({"summon": True, "text": text})
+        try:
+            async for clause in aggregate(self._text_chunks(text)):
+                await self._speak_clause(clause)
+            await self._drain_playback()
+        finally:
+            await self._broadcast({"turn": "end"})
+            state = "listening" if self.listening else "idle"
+            await self._broadcast({"state": state, "level": 0.2 if self.listening else 0.0})
+            self.speaking = False
+
+    async def _text_chunks(self, text: str) -> AsyncIterator[str]:
+        """Yield the whole text once so ``aggregate`` can split it into clauses."""
+        yield text
 
     async def _pump(
         self, ws, messages: list[dict[str, str]], delta_q: asyncio.Queue[str | None]
@@ -453,23 +641,46 @@ class VoiceLoop:
             await self._send(ws, {"transcript": text, "partial": not final})
         return text
 
-    async def _transcribe_pcm(self, pcm: bytes) -> str:
+    async def _stt_text(self, pcm: bytes) -> str:
+        """Transcribe one PCM16 buffer with Parakeet. RAISES on backend failure.
+
+        Feeds the WHOLE buffer as ONE chunk (a sub-window sliver underflows to a
+        2^64-4096 Metal alloc; one-shot on the full buffer is the model's own
+        warmup path — see stt_bridge.py). Callers pick their own failure policy:
+        the assistant path drops a bad utterance; the notes path toasts it.
+        """
         async def audio() -> AsyncIterator[bytes]:
             yield pcm
 
         text = ""
+        async for t in self.stt.stream(audio()):
+            if t.is_final:
+                text = t.text
+        return text
+
+    async def _transcribe_pcm(self, pcm: bytes) -> str:
+        """Assistant-path STT: a failed utterance is dropped, never fatal."""
         try:
-            async for t in self.stt.stream(audio()):
-                if t.is_final:
-                    text = t.text
+            return await self._stt_text(pcm)
         except Exception as exc:  # noqa: BLE001 — one bad utterance must not kill the loop
             print(f"[voice] transcription error: {exc}", flush=True)
-        return text
+            return ""
 
     async def _send(self, ws, msg: dict) -> None:
         """Best-effort JSON send; a dropped socket ends the connection loop, not us."""
         with contextlib.suppress(Exception):
             await ws.send(json.dumps(msg))
+
+    async def _broadcast(self, msg: dict) -> None:
+        """Fan a box-display event out to every connected client.
+
+        Used by proactive pushes (the morning brief): they arrive on their own
+        connection, so the glow that draws the box is a different client. Iterate a
+        snapshot — a slow/dropped socket must not abort delivery to the others."""
+        payload = json.dumps(msg)
+        for ws in list(self.clients):
+            with contextlib.suppress(Exception):
+                await ws.send(payload)
 
 
 async def main() -> None:

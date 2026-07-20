@@ -6,6 +6,8 @@ Google/Tavily calls need real credentials and are out of scope here.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import pytest
 
 from sonar_harness.tools.base import ToolContext
@@ -14,7 +16,13 @@ from sonar_harness.tools.calendar_read import (
     _event_start,
     render_events,
 )
-from sonar_harness.tools.calendar_write import CalendarCreateTool, build_event_body
+from sonar_harness.tools.calendar_write import (
+    CalendarCancelTool,
+    CalendarCreateTool,
+    CalendarRescheduleTool,
+    build_event_body,
+    rescheduled_times,
+)
 from sonar_harness.tools.gmail_read import GmailSearchTool, _header, render_messages
 from sonar_harness.tools.web_search import (
     WebSearchTool,
@@ -84,6 +92,60 @@ def test_calendar_not_connected_returns_string(monkeypatch) -> None:
     monkeypatch.setenv("SONAR_GOOGLE_TOKEN", "/nonexistent/sonar/google_token.json")
     result = CalendarAgendaTool().run({"days": 1}, _ctx())
     assert isinstance(result, str) and "google" in result.lower()
+
+
+def test_calendar_render_includes_event_id_when_present() -> None:
+    out = render_events(
+        [{"id": "abc123", "start": {"dateTime": "2026-07-09T10:00:00Z"}, "summary": "Standup"}]
+    )
+    assert "abc123" in out  # id exposed so the model can reschedule/cancel
+    # ...but omitted (no dangling tag) when the event has no id
+    assert "[id:" not in render_events([{"start": {"date": "2026-07-09"}, "summary": "Holiday"}])
+
+
+# ---- calendar reschedule / cancel ---------------------------------------------
+
+_TIMED = {
+    "start": {"dateTime": "2026-07-10T15:00:00-04:00"},
+    "end": {"dateTime": "2026-07-10T16:00:00-04:00"},  # 60-min event
+}
+
+
+def test_rescheduled_times_preserves_original_duration() -> None:
+    new_start = datetime.fromisoformat("2026-07-10T18:00:00-04:00")
+    start, end = rescheduled_times(_TIMED, new_start, {})
+    assert start == new_start
+    assert (end - start) == timedelta(hours=1)  # kept the original length
+
+
+def test_rescheduled_times_explicit_end_and_duration() -> None:
+    new_start = datetime.fromisoformat("2026-07-10T18:00:00-04:00")
+    _, end = rescheduled_times(_TIMED, new_start, {"end": "2026-07-10T18:45:00-04:00"})
+    assert end == datetime.fromisoformat("2026-07-10T18:45:00-04:00")
+    _, end2 = rescheduled_times(_TIMED, new_start, {"duration_minutes": 30})
+    assert (end2 - new_start) == timedelta(minutes=30)
+
+
+def test_rescheduled_times_defaults_when_event_is_all_day() -> None:
+    new_start = datetime.fromisoformat("2026-07-10T18:00:00-04:00")
+    _, end = rescheduled_times({"start": {"date": "2026-07-10"}}, new_start, {})
+    assert (end - new_start) == timedelta(minutes=60)  # falls back to default
+
+
+def test_reschedule_requires_event_id_and_start() -> None:
+    assert CalendarRescheduleTool().run({"start": "2026-07-10T16:00:00"}, _ctx()).startswith("error:")
+    assert CalendarRescheduleTool().run({"event_id": "x"}, _ctx()).startswith("error:")
+
+
+def test_reschedule_and_cancel_not_connected_return_string(monkeypatch) -> None:
+    monkeypatch.setenv("SONAR_GOOGLE_TOKEN", "/nonexistent/sonar/google_token.json")
+    r = CalendarRescheduleTool().run({"event_id": "x", "start": "2026-07-10T16:00:00"}, _ctx())
+    c = CalendarCancelTool().run({"event_id": "x"}, _ctx())
+    assert "google" in r.lower() and "google" in c.lower()
+
+
+def test_cancel_requires_event_id() -> None:
+    assert CalendarCancelTool().run({}, _ctx()).startswith("error:")
 
 
 # ---- calendar write (event body builder) --------------------------------------
