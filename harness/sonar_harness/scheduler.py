@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime
@@ -151,10 +152,12 @@ def brief_job(
     return Job("brief", due, done, run)
 
 
-def formatter_daily_job(*, python: Path, timeout: float = 900.0) -> Job:
-    """Nightly daily-note formatter (full run). Due any time — the runner's own
-    persistent queue catches up every unformatted note — but gated to once per
-    local day by a marker file so it isn't re-run on every tick."""
+def formatter_daily_job(*, python: Path, repo_root: Path, timeout: float = 900.0) -> Job:
+    """Nightly daily-note formatter (full run) — Sonar's own vendored
+    ``obsidian_rag``, run as an isolated subprocess (fire-and-forget: it rewrites
+    notes but surfaces NOTHING back to the harness). Due any time — the runner's
+    own persistent queue catches up every unformatted note — but gated to once
+    per local day by a marker file so it isn't re-run on every tick."""
     def marker(d: date) -> Path:
         return _SCHED_STATE / f"formatter-{d.isoformat()}.done"
 
@@ -166,14 +169,14 @@ def formatter_daily_job(*, python: Path, timeout: float = 900.0) -> Job:
 
     def run() -> None:
         _run([str(python), "-m", "obsidian_rag", "--verbose", "format-daily"],
-             cwd=python.parents[2], timeout=timeout)
+             cwd=repo_root, timeout=timeout)
         _SCHED_STATE.mkdir(parents=True, exist_ok=True)
         marker(datetime.now().astimezone().date()).touch()
 
     return Job("formatter-daily", due, done, run)
 
 
-def formatter_tags_job(*, python: Path, timeout: float = 300.0) -> Job:
+def formatter_tags_job(*, python: Path, repo_root: Path, timeout: float = 300.0) -> Job:
     """Format-tag poll: pick up notes opted-in via the format tag. A poll, so it
     runs every tick (no done-gate); the runner no-ops when nothing is tagged."""
     def due(_now: datetime) -> bool:
@@ -184,37 +187,33 @@ def formatter_tags_job(*, python: Path, timeout: float = 300.0) -> Job:
 
     def run() -> None:
         _run([str(python), "-m", "obsidian_rag", "--verbose", "format-daily", "--tags-only"],
-             cwd=python.parents[2], timeout=timeout)
+             cwd=repo_root, timeout=timeout)
 
     return Job("formatter-tags", due, done, run)
 
 
-def _formatter_python() -> Path | None:
-    """The interpreter that can ``-m obsidian_rag`` — the standalone install by
-    default, overridable via SONAR_FORMATTER_PYTHON. None (skip formatter jobs)
-    if it isn't present, so a machine without it still runs the brief."""
-    default = Path.home() / "obsidianragmcp" / ".venv" / "bin" / "python3"
-    py = Path(os.environ.get("SONAR_FORMATTER_PYTHON", str(default)))
-    return py if py.exists() else None
+def _formatter_python() -> Path:
+    """Interpreter that runs the vendored ``obsidian_rag`` formatter. Defaults to
+    the harness's OWN venv — ``obsidian_rag`` is a harness dependency (see
+    ``harness/pyproject.toml``: ``obsidian-rag = {path = "../rag"}``), so the
+    formatter runs from Sonar's own code with no external install. Overridable
+    via SONAR_FORMATTER_PYTHON (tests / packaging)."""
+    override = os.environ.get("SONAR_FORMATTER_PYTHON")
+    return Path(override) if override else Path(sys.executable)
 
 
 def default_jobs(*, vault_path: str | Path, repo_root: Path = _REPO_ROOT) -> list[Job]:
-    """The jobs the harness schedules: the brief, plus the formatter jobs when a
-    formatter interpreter is available."""
+    """The jobs the harness manages: the brief (surfaced) plus the note-formatter
+    (fire-and-forget). The formatter is Sonar's own vendored ``obsidian_rag``,
+    always scheduled — it's a required harness dependency."""
     hour = int(os.environ.get("SONAR_BRIEF_HOUR", "8"))
     minute = int(os.environ.get("SONAR_BRIEF_MIN", "0"))
-    jobs = [brief_job(repo_root=repo_root, vault_path=Path(vault_path), hour=hour, minute=minute)]
-
     python = _formatter_python()
-    if python is not None:
-        jobs.append(formatter_daily_job(python=python))
-        jobs.append(formatter_tags_job(python=python))
-    else:
-        log.warning(
-            "scheduler: formatter interpreter not found (set SONAR_FORMATTER_PYTHON) — "
-            "brief still scheduled, formatter jobs skipped"
-        )
-    return jobs
+    return [
+        brief_job(repo_root=repo_root, vault_path=Path(vault_path), hour=hour, minute=minute),
+        formatter_daily_job(python=python, repo_root=repo_root),
+        formatter_tags_job(python=python, repo_root=repo_root),
+    ]
 
 
 def start_scheduler(*, vault_path: str | Path) -> Scheduler | None:

@@ -3,6 +3,7 @@ failure-isolated) and the brief/formatter job predicates."""
 
 from __future__ import annotations
 
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -86,7 +87,7 @@ def test_brief_done_when_todays_note_exists(tmp_path: Path) -> None:
 # ---- formatter job -----------------------------------------------------------
 def test_formatter_daily_done_tracks_marker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(scheduler, "_SCHED_STATE", tmp_path / "sched")
-    job = formatter_daily_job(python=Path("/usr/bin/python3"))
+    job = formatter_daily_job(python=Path("/usr/bin/python3"), repo_root=tmp_path)
     assert job.due(NOON) is True
     assert job.done(NOON) is False
     (tmp_path / "sched").mkdir()
@@ -95,23 +96,16 @@ def test_formatter_daily_done_tracks_marker(tmp_path: Path, monkeypatch: pytest.
 
 
 # ---- default_jobs / start_scheduler -----------------------------------------
-def test_default_jobs_skips_formatter_when_interpreter_missing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("SONAR_FORMATTER_PYTHON", str(tmp_path / "nope" / "python3"))
-    jobs = default_jobs(vault_path=tmp_path)
-    assert [j.name for j in jobs] == ["brief"]
-
-
-def test_default_jobs_includes_formatter_when_present(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    fake_py = tmp_path / "venv" / "bin" / "python3"
-    fake_py.parent.mkdir(parents=True)
-    fake_py.write_text("#!/bin/sh\n", encoding="utf-8")
-    monkeypatch.setenv("SONAR_FORMATTER_PYTHON", str(fake_py))
+def test_default_jobs_are_brief_and_formatter(tmp_path: Path) -> None:
+    # Formatter is always scheduled — it's Sonar's own vendored obsidian_rag.
     names = [j.name for j in default_jobs(vault_path=tmp_path)]
     assert names == ["brief", "formatter-daily", "formatter-tags"]
+
+
+def test_formatter_uses_harness_interpreter_by_default(tmp_path: Path) -> None:
+    # No SONAR_FORMATTER_PYTHON override -> the running interpreter (harness venv,
+    # which has obsidian_rag) is used, so no external install is needed.
+    assert scheduler._formatter_python() == Path(sys.executable)
 
 
 def test_start_scheduler_disabled_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -120,8 +114,7 @@ def test_start_scheduler_disabled_returns_none(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_brief_hour_configurable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SONAR_FORMATTER_PYTHON", str(tmp_path / "nope"))
     monkeypatch.setenv("SONAR_BRIEF_HOUR", "6")
-    (job,) = default_jobs(vault_path=tmp_path)
-    assert job.due(datetime(2026, 7, 20, 6, 30)) is True
-    assert job.due(datetime(2026, 7, 20, 5, 30)) is False
+    brief = next(j for j in default_jobs(vault_path=tmp_path) if j.name == "brief")
+    assert brief.due(datetime(2026, 7, 20, 6, 30)) is True
+    assert brief.due(datetime(2026, 7, 20, 5, 30)) is False
