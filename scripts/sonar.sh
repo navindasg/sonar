@@ -13,6 +13,7 @@
 #   scripts/sonar.sh restart       # down, then up
 #   scripts/sonar.sh status        # ports, /health, models Ollama has resident
 #   scripts/sonar.sh doctor        # full preflight self-check (deps, models, health, OAuth) + fixes
+#   scripts/sonar.sh setup         # one-shot idempotent bring-up: start Ollama, pull models, daemons, then doctor
 #   scripts/sonar.sh logs          # tail -f both logs (Ctrl-C to stop tailing)
 #   scripts/sonar.sh ask "..."     # one-shot question against the running harness
 #   scripts/sonar.sh voice         # full voice loop (mic->STT->harness->TTS), foreground
@@ -315,12 +316,83 @@ cmd_logs() {
 # installer runs. Delegates to the harness module so it shares the server's
 # config + models.yaml source of truth.
 cmd_doctor() {
-  cd "$REPO_ROOT" && exec env \
-    SONAR_PORT="$HARNESS_PORT" \
-    SONAR_GLOW_PORT="$GLOW_PORT" \
-    SONAR_VAULT_PATH="$VAULT_PATH" \
-    SONAR_OLLAMA_URL="$OLLAMA_URL" \
-    uv run --project harness python -m sonar_harness.doctor "$@"
+  ( cd "$REPO_ROOT" && env \
+      SONAR_PORT="$HARNESS_PORT" \
+      SONAR_GLOW_PORT="$GLOW_PORT" \
+      SONAR_VAULT_PATH="$VAULT_PATH" \
+      SONAR_OLLAMA_URL="$OLLAMA_URL" \
+      uv run --project harness python -m sonar_harness.doctor "$@" )
+}
+
+# One-shot bring-up: get a fresh (or half-configured) machine to a ready stack.
+# IDEMPOTENT — skips whatever's already done, so it's safe to re-run and won't
+# disrupt an existing install. Does the Sonar-owned, safe steps automatically
+# (start Ollama, pull missing required models, install the durable daemons, start
+# SearXNG) and GUIDES the external/interactive ones (install uv/Ollama, set the
+# vault, Google consent). Ends with `doctor`. The required-model list comes from
+# the doctor (models.yaml) so it's never duplicated here.
+cmd_setup() {
+  echo "Sonar setup — bringing up the stack"; echo
+
+  # 1. Hard prerequisites we won't silently network-install for you.
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "  [✗] uv not found — install it, then re-run setup:"
+    echo "        curl -LsSf https://astral.sh/uv/install.sh | sh"; return 1
+  fi
+  if ! command -v ollama >/dev/null 2>&1; then
+    echo "  [✗] Ollama not found — install it (https://ollama.com), then re-run setup."; return 1
+  fi
+  echo "  [✓] uv + ollama on PATH"
+
+  # 2. Ollama daemon (start the app if it's installed but down).
+  if curl -sf "${OLLAMA_URL}/api/tags" >/dev/null 2>&1; then
+    echo "  [✓] Ollama already running (${OLLAMA_URL})"
+  else
+    echo "  [•] starting Ollama…"; open -a Ollama >/dev/null 2>&1 || (ollama serve >/dev/null 2>&1 &)
+    if _await_ollama; then echo "  [✓] Ollama up"; else
+      echo "  [✗] Ollama didn't come up — start it manually and re-run."; return 1; fi
+  fi
+
+  # 3. Required models (list sourced from the doctor / models.yaml).
+  local missing; missing="$(cd "$REPO_ROOT" && uv run --project harness python -m sonar_harness.doctor --missing-models 2>/dev/null || true)"
+  if [ -z "$missing" ]; then
+    echo "  [✓] all required models present"
+  else
+    echo "  [•] pulling missing models:"
+    while IFS= read -r m; do
+      [ -n "$m" ] || continue
+      echo "      ollama pull $m"; ollama pull "$m" || { echo "  [✗] pull failed for $m — re-run setup."; return 1; }
+    done <<< "$missing"
+    echo "  [✓] models pulled"
+  fi
+
+  # 4. Vault (can't create the user's vault; guide).
+  if [ -d "$VAULT_PATH" ]; then echo "  [✓] vault: $VAULT_PATH"
+  else echo "  [!] vault not found at '$VAULT_PATH' — set SONAR_VAULT_PATH (config/.env) to your Obsidian vault."; fi
+
+  # 5. Durable daemons — only if not already installed, so we don't swap an
+  #    existing topology (e.g. a voice install; bridge/voice share :$GLOW_PORT).
+  if launchctl list com.sonar.harness >/dev/null 2>&1; then
+    echo "  [✓] daemons already installed (com.sonar.harness loaded)"
+  else
+    echo "  [•] installing durable daemons…"; cmd_daemon install
+  fi
+
+  # 6. SearXNG (only when it's the selected search provider).
+  if [ "${SONAR_SEARCH_PROVIDER:-}" = "searxng" ]; then
+    if curl -sf "${SONAR_SEARXNG_URL:-http://127.0.0.1:8888}/config" >/dev/null 2>&1; then
+      echo "  [✓] SearXNG up"
+    else
+      echo "  [•] starting SearXNG…"; cmd_searxng up || echo "  [!] SearXNG didn't start — 'sonar.sh searxng up' to retry."
+    fi
+  fi
+
+  # 7. Google consent (interactive; guide, don't force).
+  local tok="${SONAR_GOOGLE_TOKEN:-${SONAR_CONFIG_DIR:-$HOME/.config/sonar}/google_token.json}"
+  if [ -f "$tok" ]; then echo "  [✓] Google connected"
+  else echo "  [!] Gmail/Calendar not connected (optional) — run: scripts/sonar.sh google-auth"; fi
+
+  echo; echo "── final check ────────────────────────────────"; cmd_doctor
 }
 
 cmd_ask() {
@@ -512,6 +584,7 @@ main() {
     restart) cmd_down; echo; cmd_up ;;
     status)  cmd_status ;;
     doctor)  cmd_doctor "$@" ;;
+    setup)   cmd_setup ;;
     logs)    cmd_logs ;;
     ask)         cmd_ask "$@" ;;
     voice)       cmd_voice ;;
@@ -525,7 +598,7 @@ main() {
     ""|-h|--help|help)
       sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
     *)
-      echo "unknown command: $sub (try: up | down | restart | status | doctor | logs | ask | voice | google-auth | searxng | brief | daemon)" >&2
+      echo "unknown command: $sub (try: up | down | restart | status | doctor | setup | logs | ask | voice | google-auth | searxng | brief | daemon)" >&2
       exit 1 ;;
   esac
 }

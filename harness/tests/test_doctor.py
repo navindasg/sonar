@@ -92,6 +92,18 @@ def test_required_models_from_models_yaml(monkeypatch: pytest.MonkeyPatch) -> No
     assert not set(required) & set(optional)
 
 
+def test_print_missing_models_lists_only_absent(capsys, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The setup-facing contract: print required models Ollama lacks, one per line.
+    monkeypatch.setenv("SONAR_EMBED_MODEL", "nomic-embed-text")
+    monkeypatch.setattr(doctor, "_ollama_installed_models",
+                        lambda _b: ["gemma4:e4b-mlx", "nomic-embed-text:latest"])
+    assert doctor.print_missing_models() == 0
+    out = capsys.readouterr().out.split()
+    assert "gemma4:12b-mlx" in out       # required + absent -> listed
+    assert "gemma4:e4b-mlx" not in out   # present -> skipped
+    assert "nomic-embed-text" not in out  # present as :latest -> skipped
+
+
 def test_run_checks_returns_named_checks(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

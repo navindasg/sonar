@@ -293,7 +293,18 @@ def run_checks() -> list[Check]:
     return checks
 
 
+def print_missing_models() -> int:
+    """Emit the REQUIRED model ids Ollama is missing, one per line (for
+    ``sonar.sh setup`` to pull). models.yaml stays the single source of truth."""
+    installed = _ollama_installed_models(_ollama_url()) or []
+    for m in missing_models(required_models()[0], installed):
+        print(m)
+    return 0
+
+
 def main() -> int:
+    if "--missing-models" in sys.argv[1:]:
+        return print_missing_models()
     checks = run_checks()
     print(format_report(checks))
     return exit_code(checks)
