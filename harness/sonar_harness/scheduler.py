@@ -29,10 +29,48 @@ from datetime import date, datetime, time as dtime
 from pathlib import Path
 from typing import Callable, Sequence
 
+from sonar_harness.ollama_client import DEFAULT_OLLAMA_URL
+
 log = logging.getLogger("sonar.scheduler")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCHED_STATE = Path(os.environ.get("SONAR_HOME", str(Path.home() / ".sonar"))) / "scheduler"
+
+# The vendored obsidian_rag formatter reads its config from here by default (the
+# CLI's own default). Sonar OWNS this file: it generates a working one when it's
+# missing (see ensure_formatter_config) so the formatter is self-contained on a
+# fresh install. Override the location with SONAR_FORMATTER_CONFIG.
+_DEFAULT_FORMATTER_CONFIG = Path("~/.obsidian-rag/config.yaml")
+
+# A minimal, WORKING obsidian_rag config — vault + daily_format enabled — unlike
+# the vendored DEFAULT_CONFIG (placeholder vault, formatter commented out, which
+# makes format-daily exit "enable daily_format"). Only the vault and Ollama URL
+# are filled from Sonar's own settings; everything else takes obsidian_rag's
+# defaults (model=null → auto-select). Kept as a plain template so the harness
+# needs no YAML dependency to write it.
+_FORMATTER_CONFIG_TEMPLATE = """\
+# obsidian-rag configuration — generated and MANAGED BY SONAR.
+#
+# Sonar's in-harness scheduler drives the daily-note formatter against Sonar's
+# own vendored obsidian_rag (see harness/sonar_harness/scheduler.py), so this
+# file exists to make that formatter self-contained: no manual setup on a fresh
+# install. Sonar only CREATES this file when it is missing — it never overwrites
+# it — so anything you add below (e.g. a blacklist) is preserved.
+
+vaults:
+  - name: {vault_name}
+    path: {vault_path}
+
+embedding:
+  ollama_url: {ollama_url}
+
+daily_format:
+  enabled: true
+  model: null              # auto-select from pulled models (gemma4:26b-mlx first)
+  # blacklist: dates (YYYY-MM-DD) of hand-formatted notes to leave untouched.
+  blacklist: []
+  format_tag: "#!format"   # type this in any note to queue it for formatting
+"""
 
 
 @dataclass(frozen=True)
@@ -152,12 +190,17 @@ def brief_job(
     return Job("brief", due, done, run)
 
 
-def formatter_daily_job(*, python: Path, repo_root: Path, timeout: float = 900.0) -> Job:
+def formatter_daily_job(
+    *, python: Path, repo_root: Path, config: Path | None = None, timeout: float = 900.0
+) -> Job:
     """Nightly daily-note formatter (full run) — Sonar's own vendored
     ``obsidian_rag``, run as an isolated subprocess (fire-and-forget: it rewrites
     notes but surfaces NOTHING back to the harness). Due any time — the runner's
     own persistent queue catches up every unformatted note — but gated to once
-    per local day by a marker file so it isn't re-run on every tick."""
+    per local day by a marker file so it isn't re-run on every tick. Runs against
+    the Sonar-managed config (``--config``) so it needs no external setup."""
+    cfg = config or _formatter_config_path()
+
     def marker(d: date) -> Path:
         return _SCHED_STATE / f"formatter-{d.isoformat()}.done"
 
@@ -168,17 +211,21 @@ def formatter_daily_job(*, python: Path, repo_root: Path, timeout: float = 900.0
         return marker(now.date()).exists()
 
     def run() -> None:
-        _run([str(python), "-m", "obsidian_rag", "--verbose", "format-daily"],
-             cwd=repo_root, timeout=timeout)
+        _run([str(python), "-m", "obsidian_rag", "--verbose", "format-daily",
+              "--config", str(cfg)], cwd=repo_root, timeout=timeout)
         _SCHED_STATE.mkdir(parents=True, exist_ok=True)
         marker(datetime.now().astimezone().date()).touch()
 
     return Job("formatter-daily", due, done, run)
 
 
-def formatter_tags_job(*, python: Path, repo_root: Path, timeout: float = 300.0) -> Job:
+def formatter_tags_job(
+    *, python: Path, repo_root: Path, config: Path | None = None, timeout: float = 300.0
+) -> Job:
     """Format-tag poll: pick up notes opted-in via the format tag. A poll, so it
     runs every tick (no done-gate); the runner no-ops when nothing is tagged."""
+    cfg = config or _formatter_config_path()
+
     def due(_now: datetime) -> bool:
         return True
 
@@ -186,8 +233,8 @@ def formatter_tags_job(*, python: Path, repo_root: Path, timeout: float = 300.0)
         return False
 
     def run() -> None:
-        _run([str(python), "-m", "obsidian_rag", "--verbose", "format-daily", "--tags-only"],
-             cwd=repo_root, timeout=timeout)
+        _run([str(python), "-m", "obsidian_rag", "--verbose", "format-daily",
+              "--tags-only", "--config", str(cfg)], cwd=repo_root, timeout=timeout)
 
     return Job("formatter-tags", due, done, run)
 
@@ -202,6 +249,37 @@ def _formatter_python() -> Path:
     return Path(override) if override else Path(sys.executable)
 
 
+def _formatter_config_path() -> Path:
+    """Where the Sonar-managed formatter config lives. Defaults to obsidian_rag's
+    own default location; override with SONAR_FORMATTER_CONFIG."""
+    return Path(
+        os.environ.get("SONAR_FORMATTER_CONFIG", str(_DEFAULT_FORMATTER_CONFIG))
+    ).expanduser()
+
+
+def ensure_formatter_config(
+    path: Path, *, vault_path: str | Path, vault_name: str, ollama_url: str
+) -> Path:
+    """Make the formatter self-contained: write a WORKING obsidian_rag config at
+    ``path`` if none exists yet, filled from Sonar's own vault/Ollama settings.
+
+    CREATE-ONLY — it never overwrites an existing file, so a user's own config
+    (and any hand-formatted-note blacklist in it) is always preserved. On a fresh
+    machine this is what lets the scheduled formatter run with zero manual setup.
+    Returns ``path`` either way."""
+    if path.exists():
+        return path
+    content = _FORMATTER_CONFIG_TEMPLATE.format(
+        vault_name=vault_name, vault_path=str(vault_path), ollama_url=ollama_url
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)  # atomic: never leave a half-written config
+    log.info("scheduler: generated Sonar-managed formatter config at %s", path)
+    return path
+
+
 def default_jobs(*, vault_path: str | Path, repo_root: Path = _REPO_ROOT) -> list[Job]:
     """The jobs the harness manages: the brief (surfaced) plus the note-formatter
     (fire-and-forget). The formatter is Sonar's own vendored ``obsidian_rag``,
@@ -209,19 +287,27 @@ def default_jobs(*, vault_path: str | Path, repo_root: Path = _REPO_ROOT) -> lis
     hour = int(os.environ.get("SONAR_BRIEF_HOUR", "8"))
     minute = int(os.environ.get("SONAR_BRIEF_MIN", "0"))
     python = _formatter_python()
+    config = _formatter_config_path()
     return [
         brief_job(repo_root=repo_root, vault_path=Path(vault_path), hour=hour, minute=minute),
-        formatter_daily_job(python=python, repo_root=repo_root),
-        formatter_tags_job(python=python, repo_root=repo_root),
+        formatter_daily_job(python=python, repo_root=repo_root, config=config),
+        formatter_tags_job(python=python, repo_root=repo_root, config=config),
     ]
 
 
 def start_scheduler(*, vault_path: str | Path) -> Scheduler | None:
     """Build + start the harness scheduler, or return None if disabled via
-    SONAR_SCHED_ENABLED=0."""
+    SONAR_SCHED_ENABLED=0. Also generates the Sonar-managed formatter config on
+    first run so the formatter is self-contained (create-only; never clobbers)."""
     if os.environ.get("SONAR_SCHED_ENABLED", "1").lower() not in ("1", "true", "yes", "on"):
         log.info("scheduler disabled (SONAR_SCHED_ENABLED)")
         return None
+    ensure_formatter_config(
+        _formatter_config_path(),
+        vault_path=vault_path,
+        vault_name=os.environ.get("SONAR_VAULT_NAME", "sonar"),
+        ollama_url=os.environ.get("SONAR_OLLAMA_URL", DEFAULT_OLLAMA_URL),
+    )
     interval = float(os.environ.get("SONAR_SCHED_INTERVAL_S", "300"))
     scheduler = Scheduler(default_jobs(vault_path=vault_path), interval_s=interval)
     scheduler.start()
