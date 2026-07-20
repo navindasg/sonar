@@ -30,6 +30,7 @@ local M = {
   phase = 0.0, visible = false, state = "idle", level = 0.0,
   wsGen = 0, wsOpen = false, texture = nil,
   bar = nil, barUCC = nil, lastTyped = nil, committed = "",
+  summoned = false, summonHideTimer = nil,
 }
 M.texture = hs.image.imageFromPath(TEXTURE)
 
@@ -241,8 +242,18 @@ function M.resizeBar(h)
   M.bar:frame(hs.geometry.rect(f.x, f.y, BAR_W, target))
 end
 
+-- A summoned box (proactive push, e.g. the morning brief) auto-hides after a
+-- linger UNLESS the user takes it over — opens/closes the overlay, or types into
+-- it. Any of those calls this to cancel the pending auto-hide and forget it was
+-- a push, so the box behaves like a normal user session from then on.
+function M.clearSummon()
+  M.summoned = false
+  if M.summonHideTimer then M.summonHideTimer:stop(); M.summonHideTimer = nil end
+end
+
 -- Send a typed question to the bridge, which runs it through the harness.
 function M.sendText(t)
+  M.clearSummon()   -- typing means the user has taken the box over
   if M.ws and M.wsOpen then
     pcall(function() M.ws:send(hs.json.encode({ text = t })) end)
   else
@@ -293,6 +304,7 @@ connect = function()
       if okd and type(data) == "table" then
         if data.state then M.state = data.state end
         M.level = tonumber(data.level) or M.level
+        if data.summon then M.summonBox(data.text) end
         if data.transcript ~= nil then
           M.rxTranscript = data.transcript
           M.onTranscript(data.transcript, data.partial == true)
@@ -305,6 +317,7 @@ connect = function()
         elseif data.turn == "end" then
           M.evalBar("window.sonar && sonar.setBusy(false)")
           M.turnDone = true   -- next utterance clears the box (see M.onTranscript)
+          if M.summoned then M.scheduleSummonHide() end
         end
       else
         print("[sonar-rx] decode failed: " .. tostring(message))
@@ -323,6 +336,7 @@ local function sendCmd(cmd)
 end
 local function showOverlay()
   if M.visible then return end
+  M.clearSummon()    -- a real F5 press: this is now a user session, not a push
   M.committed = ""   -- fresh transcript each time the box opens
   M.visible = true; M.state = "listening"; render(); showAll(); M.showBar()
   hs.timer.doAfter(0.16, function() M.evalBar("window.sonar && sonar.clearTurn()") end)
@@ -330,11 +344,45 @@ local function showOverlay()
 end
 local function hideOverlay()
   if not M.visible then return end
+  M.clearSummon()    -- dismissing (F5 or auto-hide): stop tracking it as a push
   M.visible = false; hideAll(); M.hideBar()
   sendCmd("stop")    -- tell the STT bridge to stop listening
 end
 local function toggleOverlay()
   if M.visible then hideOverlay() else showOverlay() end
+end
+
+-- ---- proactive push (summon) --------------------------------------------------
+-- The morning brief speaks on its OWN short-lived connection, so the glow that
+-- draws the box is a different client. The voice loop broadcasts {summon, text}
+-- to every client; here we reveal the (normally F5-gated) box and show the whole
+-- message at once — WITHOUT opening the mic (no sendCmd("start")).
+local SUMMON_LINGER_S = tonumber(os.getenv("SONAR_SUMMON_LINGER_S") or "") or 30
+function M.summonBox(text)
+  if M.summonHideTimer then M.summonHideTimer:stop(); M.summonHideTimer = nil end
+  M.summoned = true
+  M.committed = ""
+  M.visible = true; M.state = "speaking"; render(); showAll(); M.showBar()
+  -- One deferred callback (the freshly-(re)built webview needs a beat to load):
+  -- clear THEN set the text together, so no stray clearTurn can wipe it — the
+  -- clear-race that showOverlay's own delayed clearTurn would otherwise cause.
+  local msg = text or ""
+  hs.timer.doAfter(0.16, function()
+    M.evalBar("window.sonar && sonar.clearTurn(); window.sonar && sonar.setBusy(true)")
+    if msg ~= "" then
+      M.evalBar(("window.sonar && sonar.appendAnswer('%s')"):format(jsEsc(msg)))
+    end
+  end)
+end
+
+-- Once the brief finishes speaking (turn:end), keep the box up for a linger so it
+-- can be read, then hide it — but only if the user never took it over.
+function M.scheduleSummonHide()
+  if M.summonHideTimer then M.summonHideTimer:stop() end
+  M.summonHideTimer = hs.timer.doAfter(SUMMON_LINGER_S, function()
+    M.summonHideTimer = nil
+    if M.summoned then hideOverlay() end
+  end)
 end
 
 local function start()

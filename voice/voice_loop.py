@@ -142,6 +142,7 @@ class VoiceLoop:
         self._last_ack: str | None = None
         self.notes: NotesController | None = None  # built in load()
         self._notes_ws: Any | None = None          # overlay conn that started notes
+        self.clients: set[Any] = set()             # every connected overlay/poker WS
 
     async def load(self) -> None:
         print("[voice] loading parakeet STT (first run downloads ~1-2GB)…", flush=True)
@@ -219,6 +220,7 @@ class VoiceLoop:
     # ---- connection handling ----
     async def handler(self, ws) -> None:
         print("[voice] overlay connected", flush=True)
+        self.clients.add(ws)
         self.loop = asyncio.get_running_loop()
         consumer = asyncio.create_task(self._consume(ws))
         try:
@@ -268,6 +270,7 @@ class VoiceLoop:
                     await self._send(ws, {"state": "idle", "level": 0.0})
                     print("[voice] stopped", flush=True)
         finally:
+            self.clients.discard(ws)
             consumer.cancel()
             self.listening = False
             # Tearing the connection down cancels _consume — the ONLY thing
@@ -534,24 +537,29 @@ class VoiceLoop:
 
     async def _speak_text(self, ws, text: str) -> None:
         """Speak already-composed text with NO harness turn (a proactive push, e.g.
-        the scheduled morning brief). Displays the full text in the box (visible if
-        it's open) and streams it to Kokoro clause by clause. Cancellable like a
-        normal turn, so an F5 cutoff (``_silence``) silences it too.
+        the scheduled morning brief). Summons the overlay box to show the full text
+        and streams it to Kokoro clause by clause. Cancellable like a normal turn,
+        so an F5 cutoff (``_silence``) silences it too.
+
+        The display events BROADCAST to every connected client, not just ``ws``: a
+        proactive push arrives on its own short-lived connection (morning_brief.py),
+        so the glow that actually draws the box is a DIFFERENT client — sending only
+        to the poker left the box empty (the v1 caveat this fixes). The ``summon``
+        flag tells the glow to reveal its (normally hidden) box and show ``text``.
         """
         self.speaking = True
         self.gate.reset()
         self.player.set_gain(1.0)
-        await self._send(ws, {"turn": "start"})
-        await self._send(ws, {"answer": text, "partial": True})
+        await self._broadcast({"turn": "start"})
+        await self._broadcast({"summon": True, "text": text})
         try:
             async for clause in aggregate(self._text_chunks(text)):
                 await self._speak_clause(clause)
             await self._drain_playback()
         finally:
-            await self._send(ws, {"answer": "", "partial": False})
-            await self._send(ws, {"turn": "end"})
+            await self._broadcast({"turn": "end"})
             state = "listening" if self.listening else "idle"
-            await self._send(ws, {"state": state, "level": 0.2 if self.listening else 0.0})
+            await self._broadcast({"state": state, "level": 0.2 if self.listening else 0.0})
             self.speaking = False
 
     async def _text_chunks(self, text: str) -> AsyncIterator[str]:
@@ -662,6 +670,17 @@ class VoiceLoop:
         """Best-effort JSON send; a dropped socket ends the connection loop, not us."""
         with contextlib.suppress(Exception):
             await ws.send(json.dumps(msg))
+
+    async def _broadcast(self, msg: dict) -> None:
+        """Fan a box-display event out to every connected client.
+
+        Used by proactive pushes (the morning brief): they arrive on their own
+        connection, so the glow that draws the box is a different client. Iterate a
+        snapshot — a slow/dropped socket must not abort delivery to the others."""
+        payload = json.dumps(msg)
+        for ws in list(self.clients):
+            with contextlib.suppress(Exception):
+                await ws.send(payload)
 
 
 async def main() -> None:
