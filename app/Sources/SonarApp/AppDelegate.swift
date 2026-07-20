@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var notesWindow: NotesWindowController?
     private var watcher: NotesURLWatcher?
     private var health: HealthPoller?
+    private var services: ServiceProbe?
     private var backend: NotesBackend?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -30,6 +31,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         health.start()
         self.health = health
+
+        // Voice (:8770) + Notes (:8771) liveness for the popover's stack-status
+        // rows; the harness row comes from the health poll above.
+        let services = ServiceProbe(voiceURL: config.voiceProbeURL, notesURL: config.notesURL)
+        services.onUpdate = { [weak self] status in
+            self?.statusItem?.setServices(status)
+        }
+        services.start()
+        self.services = services
 
         // notes.url appearing/updating means the page is already serveable —
         // raise the window at whatever URL it names.
@@ -53,6 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         watcher?.stop()
         health?.stop()
+        services?.stop()
         backend?.terminate()
     }
 }
