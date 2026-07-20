@@ -1,8 +1,11 @@
 -- Sonar — S1 overlay spike (Hammerspoon)
 -- Two throwaway pieces that lock the signature look before the native Swift app:
---   1. GLOW — a dark "cave" vignette: a grainy near-black shadow that hugs the
---             screen edges and fades to a clear centre. No colour, no cycling —
---             only its overall opacity breathes and lifts a touch when active.
+--   1. GLOW — the Dark Knight "sonar" edge: a dark cave vignette hugging every
+--             screen edge, fringed with small, curvy BLACK SPIKES that slowly
+--             WAVE as if in wind, with rain drifting down and sonar-blue (batsuit-
+--             eye) light leaking in — warming to amber while speaking. Drawn
+--             procedurally on a single click-through canvas; the centre stays
+--             clear so the desktop is usable.
 --   2. BAR  — a dark command bar showing what you say (live transcript) that can
 --             also be typed into when you can't talk.
 -- Summon both with F13 (after the F5->F13 remap) or the fallback chord Cmd+Alt+Ctrl+G.
@@ -13,65 +16,300 @@ local WS_PORT = os.getenv("SONAR_GLOW_PORT") or "8770"
 local WS_URL  = "ws://" .. WS_HOST .. ":" .. WS_PORT
 local FPS     = 30
 
--- Overall glow opacity per state — NO colour change, just how deep the cave is.
-local INTENSITY = { idle = 0.16, listening = 0.92, thinking = 0.96, speaking = 1.0 }
+-- ============================================================ glow config
+-- The cave is composed from procedural layers; every knob below is env-overridable
+-- so the overlay's look is configurable without editing code. DEFAULT = the look
+-- Navin signed off on: 80% intensity/wind/rain, 50% spike length, grit in the
+-- blades, and sonar-sweep rings only while listening.
+local function _envnum(k, d) return tonumber(os.getenv(k) or "") or d end
+local function _envbool(k, d)
+  local v = os.getenv(k); if not v or v == "" then return d end
+  v = v:lower(); return v == "1" or v == "true" or v == "yes" or v == "on"
+end
+local function _envstr(k, d) local v = os.getenv(k); if v and v ~= "" then return v end; return d end
 
--- Resolve vignette.png next to this file (works through the ~/.hammerspoon symlink).
+local GLOW = {
+  intensity = _envnum("SONAR_GLOW_INTENSITY", 0.80),     -- master presence 0..1
+  wind      = _envnum("SONAR_GLOW_WIND", 0.80),          -- how hard the spikes wave 0..1
+  len       = _envnum("SONAR_GLOW_LEN", 0.50),           -- spike length 0..1
+  rain      = _envnum("SONAR_GLOW_RAIN", 0.80),          -- rainfall density 0..1 (0 = off)
+  reactive  = _envbool("SONAR_GLOW_REACTIVE", true),     -- breathe + wave harder with mic level
+  sweep     = _envstr("SONAR_GLOW_SWEEP", "listening"),  -- sonar rings: off|<state>|active|always
+}
+
+-- The ONE light, per state: graphite idle, sonar-vision blue while listening or
+-- thinking (the Dark Knight sonar cue), sodium amber while speaking. {r,g,b} 0..1.
+local GLOW_HUE = {
+  idle      = { 0.50, 0.55, 0.62 },
+  listening = { 0.41, 0.65, 0.80 },
+  thinking  = { 0.41, 0.65, 0.80 },
+  speaking  = { 0.91, 0.65, 0.29 },
+}
+-- How deep the cave sits per state (edge darkening only; the centre stays clear
+-- so the desktop stays usable). Scaled by GLOW.intensity. Tuned to read the
+-- spiky rim even over a bright desktop.
+local GLOW_VEIL = { idle = 0.42, listening = 0.78, thinking = 0.82, speaking = 0.86 }
+
+-- This overlay is pure hs.canvas (the only click-through surface); the shipped
+-- vignette.png is no longer used for the glow — the cave edge is now drawn
+-- procedurally so the spikes can actually MOVE. scriptDir still resolves this
+-- file's folder for the config watcher (through the ~/.hammerspoon symlink).
 local function scriptDir()
   local src = debug.getinfo(1, "S").source:match("@(.*)")
   local real = (src and hs.fs.pathToAbsolute(src)) or src
   return (real and real:match("(.*/)")) or "./"
 end
-local TEXTURE = scriptDir() .. "vignette.png"
 
 -- ============================================================ state
 local M = {
   canvases = {}, ws = nil, animTimer = nil, screenWatcher = nil,
-  phase = 0.0, visible = false, state = "idle", level = 0.0,
-  wsGen = 0, wsOpen = false, texture = nil,
+  animT = 0.0, visible = false, state = "idle", level = 0.0,
+  wsGen = 0, wsOpen = false,
   bar = nil, barUCC = nil, lastTyped = nil, committed = "",
   summoned = false, summonHideTimer = nil,
 }
-M.texture = hs.image.imageFromPath(TEXTURE)
 
--- ============================================================ glow (cave vignette)
+-- ============================================================ glow (waving cave)
+-- The signature Dark Knight "sonar" edge, brought to life. A dark cave gradient
+-- hugs every screen edge; batsuit-eye sonar-blue light leaks in beneath a fringe
+-- of small, curvy, rough-edged BLACK SPIKES that slowly wave as if in wind; faint rain
+-- drifts down over it; and while listening, sonar rings ping out from a corner.
+-- Colour tracks the ONE light (blue cold, amber speaking). Every layer is drawn
+-- procedurally on a single click-through canvas per screen — the centre stays
+-- clear so the desktop is fully usable. All amounts are env-tunable (see GLOW).
+local SWEEP_SLOTS = 4
+local DT  = 1 / FPS
+local TAU = math.pi * 2
+local NS      = math.max(3, math.floor(_envnum("SONAR_GLOW_SAMPLES", 7)))  -- samples per blade spine
+local SPACING = math.max(8, _envnum("SONAR_GLOW_SPACING", 26))             -- px between blade roots
+local function hueOf(state) return GLOW_HUE[state] or GLOW_HUE.idle end
+local function col(h, a) return { red = h[1], green = h[2], blue = h[3], alpha = math.max(0, math.min(1, a)) } end
+
+-- Small deterministic LCG so a screen's spike field is stable frame-to-frame.
+local function makeRng(seed)
+  local s = seed % 2147483648
+  return function() s = (s * 1103515245 + 12345) % 2147483648; return s / 2147483648 end
+end
+
+-- The four edges as (origin o, inward-normal n, along-tangent a, length). gAngle is
+-- the fillGradient angle that runs a blade/band dark-at-the-edge -> clear-inward
+-- (0 = +x/right, 90 = +y/down, 180 = -x/left, 270 = -y/up — the hs.canvas
+-- convention confirmed by an off-screen probe).
+local function buildEdges(W, H)
+  return {
+    { side = "top",    ox=0, oy=0, nx=0,  ny=1,  ax=1,  ay=0,  len=W, gAngle=90  },
+    { side = "bottom", ox=W, oy=H, nx=0,  ny=-1, ax=-1, ay=0,  len=W, gAngle=270 },
+    { side = "left",   ox=0, oy=H, nx=1,  ny=0,  ax=0,  ay=-1, len=H, gAngle=0   },
+    { side = "right",  ox=W, oy=0, nx=-1, ny=0,  ax=0,  ay=1,  len=H, gAngle=180 },
+  }
+end
+
+-- Real, deliberately-shaped spikes: each blade gets a varied length/phase and
+-- three sine terms whose sum makes its spine curvy (not a straight tooth) and,
+-- animated over time, makes it wave. Built once per screen size.
+local function buildSpikeField(W, H)
+  local rng = makeRng(1337)
+  local edges = buildEdges(W, H)
+  for _, ed in ipairs(edges) do
+    ed.spikes = {}
+    local d = SPACING * 0.5
+    while d < ed.len - SPACING * 0.5 do
+      ed.spikes[#ed.spikes + 1] = {
+        d     = d + (rng() - 0.5) * SPACING * 0.6,
+        lenF  = 0.45 + rng() * 0.85,      -- length variation
+        phase = rng() * TAU,              -- wind phase
+        hw    = SPACING * (0.20 + rng() * 0.17),
+        a1 = 0.10 + rng()*0.22, f1 = 4.5 + rng()*6.5, p1 = rng()*TAU,  -- primary undulation
+        a2 = 0.05 + rng()*0.14, f2 = 8   + rng()*10,  p2 = rng()*TAU,  -- secondary wave
+        a3 = 0.03 + rng()*0.06, f3 = 16  + rng()*12,  p3 = rng()*TAU,  -- fine grainy jitter
+      }
+      d = d + SPACING
+    end
+  end
+  return edges
+end
+
+-- Map an edge-local coordinate (ad along the edge, nd inward) to screen x,y.
+local function P(ed, ad, nd)
+  return ed.ox + ed.ax * ad + ed.nx * nd, ed.oy + ed.ay * ad + ed.ny * nd
+end
+
+-- Outer band rectangle for an edge (used by the cave + edge-light gradients).
+local function bandFrame(ed, W, H, reach)
+  if     ed.side == "top"    then return { x=0,       y=0,       w=W,     h=reach }
+  elseif ed.side == "bottom" then return { x=0,       y=H-reach, w=W,     h=reach }
+  elseif ed.side == "left"   then return { x=0,       y=0,       w=reach, h=H }
+  else                            return { x=W-reach, y=0,       w=reach, h=H } end
+end
+
+local function sweepActive()
+  local s = GLOW.sweep
+  if s == "always" then return true end
+  if s == "off" then return false end
+  if s == "active" then return M.state == "listening" or M.state == "thinking" or M.state == "speaking" end
+  return M.state == s   -- e.g. the default "listening"
+end
+
+-- Compose one screen's frame. Draw order is chosen so a SINGLE click-through
+-- canvas yields, back-to-front: cave < edge light < blades < rings < rain —
+-- using destinationOver to tuck the cave + edge glow behind the blades.
+local function buildScene(entry)
+  local W, H, edges = entry.w, entry.h, entry.edges
+  local t = M.animT
+  local hue = hueOf(M.state)
+  local veil = GLOW_VEIL[M.state] or 0.30
+  local intensity = GLOW.intensity
+  local mic = GLOW.reactive and math.max(0, math.min(1, M.level)) or 0
+  local react  = 0.75 + 0.45 * mic
+  local breath = 0.92 + 0.08 * math.sin(t * 0.8)
+  local maxLen   = 6 + GLOW.len * 40
+  local windAmp  = (5 + GLOW.wind * 24) * (0.7 + 0.5 * mic)
+  local lenScale = (0.5 + veil * 0.7) * (0.85 + 0.3 * breath)
+  local flowT = t * 0.7
+  local els = {}
+
+  -- (a) the waving spikes — one sinuous, tapered dark blade per segments element
+  local rootA = math.min(1, 1.25 * veil * intensity * react * breath)
+  for _, ed in ipairs(edges) do
+    local grad = { { red=0.004, green=0.012, blue=0.024, alpha=rootA },
+                   { red=0.016, green=0.030, blue=0.047, alpha=0.0 } }
+    for _, s in ipairs(ed.spikes) do
+      -- taper blades toward each corner (within ~4 spacings of the edge ends) so
+      -- the two edges meeting there don't pile into a heavy flame.
+      local ef = math.min(1, math.min(s.d, ed.len - s.d) / (SPACING * 4))
+      local len = maxLen * s.lenF * lenScale * (0.35 + 0.65 * ef)
+      local sway = windAmp * math.sin(t - s.d * 0.011 + s.phase)
+      local left, right = {}, {}
+      for k = 0, NS do
+        local tt = k / NS
+        local bend = len * tt * ( s.a1 * math.sin(tt*s.f1 + s.p1 + flowT)
+                                + s.a2 * math.sin(tt*s.f2 + s.p2 - flowT*0.6)
+                                + s.a3 * math.sin(tt*s.f3 + s.p3 + flowT*1.4) )
+                   + sway * tt * tt
+        local along, inward = s.d + bend, len * tt
+        local hw = s.hw * (1 - tt) * (1 - 0.25 * tt)
+        local lx, ly = P(ed, along - hw, inward)
+        local rx, ry = P(ed, along + hw, inward)
+        left[k + 1] = { x=lx, y=ly }
+        right[NS - k + 1] = { x=rx, y=ry }
+      end
+      for i = 1, #right do left[#left + 1] = right[i] end
+      els[#els + 1] = { type="segments", closed=true, action="fill",
+        fillGradient="linear", fillGradientColors=grad, fillGradientAngle=ed.gAngle,
+        coordinates=left }
+    end
+  end
+
+  -- (b) blue/amber sonar light leaking in at the very edge, tucked BEHIND the blades
+  local eA = 0.16 * intensity * react
+  for _, ed in ipairs(edges) do
+    els[#els + 1] = { type="rectangle", action="fill", compositeRule="destinationOver",
+      fillGradient="linear", fillGradientAngle=ed.gAngle,
+      fillGradientColors={ { red=hue[1], green=hue[2], blue=hue[3], alpha=eA },
+                           { red=hue[1], green=hue[2], blue=hue[3], alpha=0.0 } },
+      frame=bandFrame(ed, W, H, 55) }
+  end
+
+  -- (c) the dark cave depth, behind everything, so the edges read heavy
+  local cA = math.min(1, 0.72 * veil * intensity)
+  for _, ed in ipairs(edges) do
+    els[#els + 1] = { type="rectangle", action="fill", compositeRule="destinationOver",
+      fillGradient="linear", fillGradientAngle=ed.gAngle,
+      fillGradientColors={ { red=0.008, green=0.016, blue=0.027, alpha=cA },
+                           { red=0.008, green=0.016, blue=0.027, alpha=0.0 } },
+      frame=bandFrame(ed, W, H, 160) }
+  end
+
+  -- (d) sonar rings — faint pings from a corner while listening (on top)
+  if GLOW.sweep ~= "off" and M.rings then
+    local ax, ay = W * 0.82, H * 0.20
+    local maxR = math.sqrt(W * W + H * H) * 0.38
+    for i = 1, SWEEP_SLOTS do
+      local rg = M.rings[i]
+      if rg and rg.active then
+        els[#els + 1] = { type="circle", center={ x=ax, y=ay }, radius=math.max(1, rg.age * maxR),
+          action="stroke", compositeRule="plusLighter", strokeWidth=2.0,
+          strokeColor=col(hue, (1 - rg.age) * 0.55 * intensity * react) }
+      end
+    end
+  end
+
+  -- (e) rain — faint state-coloured streaks drifting down, topmost
+  if GLOW.rain > 0 then
+    local n  = math.floor(GLOW.rain * 70)
+    local ra = 0.12 * intensity
+    for r = 0, n - 1 do
+      local base = ((r * 97.13) % 100) / 100
+      local spd  = 0.4 + ((r * 53.7) % 100) / 100 * 0.7
+      local ln   = 0.02 + ((r * 31.1) % 100) / 100 * 0.03
+      local yy = ((base + t * spd * 0.35) % 1.15) - 0.075
+      local xx = (base + t * spd * 0.08) % 1
+      local px, py = xx * W, yy * H
+      els[#els + 1] = { type="segments", action="stroke", strokeWidth=1.0, strokeColor=col(hue, ra),
+        coordinates={ { x=px, y=py }, { x=px - ln * W * 0.10, y=py - ln * H } } }
+    end
+  end
+
+  return els
+end
+
+local function ensureFields()
+  if not M.rings then
+    M.rings = {}
+    for i = 1, SWEEP_SLOTS do M.rings[i] = { active = false, age = 0 } end
+  end
+end
+
+-- Spawn + age the sonar rings once per frame (shared across screens).
+local function stepRings()
+  if GLOW.sweep == "off" then return end
+  M.ringT = (M.ringT or 0) - DT
+  if sweepActive() and M.ringT <= 0 then
+    for i = 1, SWEEP_SLOTS do
+      if not M.rings[i].active then M.rings[i].active = true; M.rings[i].age = 0; break end
+    end
+    M.ringT = 1.7   -- spawn period (s)
+  end
+  for i = 1, SWEEP_SLOTS do
+    local rg = M.rings[i]
+    if rg.active then rg.age = rg.age + DT / 3.4; if rg.age >= 1 then rg.active = false end end
+  end
+end
+
+-- Each entry is { c = canvas, w, h, edges } so render never re-queries the frame.
 local function buildCanvas(screen)
-  local canvas = hs.canvas.new(screen:fullFrame())
+  local f = screen:fullFrame()
+  local canvas = hs.canvas.new(f)
   canvas:level(hs.canvas.windowLevels.screenSaver)
   canvas:behaviorAsLabels({ "canJoinAllSpaces", "stationary", "fullScreenAuxiliary" })
   canvas:canvasMouseEvents(false, false, false, false)  -- fully click-through
-  canvas:replaceElements({
-    { type = "image", image = M.texture, imageScaling = "scaleToFill", imageAlpha = 1.0 },
-  })
-  canvas:alpha(0.0)
-  return canvas
-end
-
-local function currentIntensity()
-  local target = INTENSITY[M.state] or INTENSITY.idle
-  local breath = 0.5 + 0.5 * math.sin(M.phase)          -- slow, calm
-  local lift = 0.90 + 0.10 * breath
-  local levelGain = 0.85 + 0.15 * M.level
-  return math.max(0.0, math.min(1.0, target * lift * levelGain))
+  local entry = { c = canvas, w = f.w, h = f.h, edges = buildSpikeField(f.w, f.h) }
+  pcall(function() canvas:replaceElements(buildScene(entry)) end)
+  canvas:alpha(1.0)
+  return entry
 end
 
 local function render()
-  local a = currentIntensity()
-  for _, canvas in ipairs(M.canvases) do canvas:alpha(a) end
+  ensureFields()
+  stepRings()
+  for _, e in ipairs(M.canvases) do
+    pcall(function() e.c:replaceElements(buildScene(e)) end)
+  end
 end
 
-local function showAll() for _, c in ipairs(M.canvases) do c:show() end end
-local function hideAll() for _, c in ipairs(M.canvases) do c:hide() end end
+local function showAll() for _, e in ipairs(M.canvases) do e.c:show() end end
+local function hideAll() for _, e in ipairs(M.canvases) do e.c:hide() end end
 
 local function layout()
-  for _, c in ipairs(M.canvases) do c:delete() end
+  ensureFields()
+  for _, e in ipairs(M.canvases) do pcall(function() e.c:delete() end) end
   local built = {}
   local ok, screens = pcall(hs.screen.allScreens)
   if ok and screens then
     for _, screen in ipairs(screens) do
-      local okc, canvas = pcall(buildCanvas, screen)
-      if okc and canvas then built[#built + 1] = canvas
-      else print("[sonar] canvas build failed: " .. tostring(canvas)) end
+      local okc, entry = pcall(buildCanvas, screen)
+      if okc and entry then built[#built + 1] = entry
+      else print("[sonar] canvas build failed: " .. tostring(entry)) end
     end
   end
   M.canvases = built
@@ -549,7 +787,11 @@ local function start()
     end
   end):start()
   M.animTimer = hs.timer.doEvery(1 / FPS, function()
-    M.phase = (M.phase + (2 * math.pi * 0.12) / FPS) % (2 * math.pi)   -- ~8s breath
+    -- The unbounded clock the wave/rain math reads. Wrapped at a big multiple of
+    -- TAU to hold float precision over long uptimes; the bare sin(t) terms stay
+    -- seamless across the wrap (the fractional-frequency terms take a one-frame
+    -- hop every ~7h of continuous visibility — imperceptible).
+    M.animT = (M.animT + DT) % (TAU * 4096)
     if M.visible then render() end
   end)
   connect()
@@ -566,7 +808,6 @@ local function start()
   hs.hotkey.bind({}, "f13", toggleOverlay)
   -- Same toggle on the fallback chord (test without the remap).
   hs.hotkey.bind({ "cmd", "alt", "ctrl" }, "g", toggleOverlay)
-  if not M.texture then hs.alert.show("Sonar: vignette.png missing — run gen_vignette.py", 3) end
   hs.alert.show("Sonar overlay loaded — F13 or ⌘⌥⌃G", 1.2)
 end
 
@@ -592,9 +833,38 @@ sonarGlow = {
   status = function()
     return hs.inspect({
       visible = M.visible, state = M.state, level = M.level, screens = #M.canvases,
-      ws_connected = M.ws ~= nil, ws_open = M.wsOpen, texture = M.texture ~= nil, bar = M.bar ~= nil,
+      ws_connected = M.ws ~= nil, ws_open = M.wsOpen, bar = M.bar ~= nil,
       lastTyped = M.lastTyped, rxCount = M.rxCount or 0, lastRx = M.lastRx, rxTranscript = M.rxTranscript,
     })
+  end,
+  -- Headless visual QA: render the first screen's scene at a chosen state/level
+  -- into a PNG WITHOUT showing it (no screen clutter), so the look can be eyeballed
+  -- off-machine. Pass bg=true to composite a mock desktop behind it (destinationOver)
+  -- so the overlay reads like it will over a real wallpaper, not on pure black.
+  --   hs -c 'sonarGlow.snap("/tmp/glow.png","listening",0.4,true)'
+  snap = function(path, st, lvl, bg)
+    local prevState, prevLevel = M.state, M.level   -- snapshot; this hook must not leak state
+    if st then M.state = st end
+    if lvl then M.level = tonumber(lvl) or M.level end
+    ensureFields()
+    local e = M.canvases[1]
+    if not e then M.state, M.level = prevState, prevLevel; return "no-canvas" end
+    local okr = pcall(function() e.c:replaceElements(buildScene(e)) end)
+    if okr and bg then
+      pcall(function() e.c:appendElements({ type="rectangle", action="fill",
+        compositeRule="destinationOver", fillGradient="linear", fillGradientAngle=135,
+        fillGradientColors={ { red=0.10, green=0.14, blue=0.20, alpha=1 },
+                             { red=0.03, green=0.05, blue=0.09, alpha=1 } },
+        frame={ x=0, y=0, w=e.w, h=e.h } }) end)
+    end
+    local img = okr and e.c:imageFromCanvas() or nil
+    -- restore shared state AND re-render the real canvas clean (no mock-bg rect)
+    M.state, M.level = prevState, prevLevel
+    pcall(function() e.c:replaceElements(buildScene(e)) end)
+    if not okr then return "render-failed" end
+    if not img then return "no-image" end
+    img:saveToFile(path)
+    return "ok:" .. path
   end,
 }
 

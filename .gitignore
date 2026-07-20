@@ -64,9 +64,6 @@ PLANNING.md
 scratch/
 notes/local/
 
-# ─── Generated spike assets (regenerate with the script next to them) ───
-spike/glow/vignette.png
-
 # ─── macOS / misc ───
 .DS_Store
 *.log
