@@ -12,6 +12,7 @@
 #   scripts/sonar.sh down          # stop both
 #   scripts/sonar.sh restart       # down, then up
 #   scripts/sonar.sh status        # ports, /health, models Ollama has resident
+#   scripts/sonar.sh doctor        # full preflight self-check (deps, models, health, OAuth) + fixes
 #   scripts/sonar.sh logs          # tail -f both logs (Ctrl-C to stop tailing)
 #   scripts/sonar.sh ask "..."     # one-shot question against the running harness
 #   scripts/sonar.sh voice         # full voice loop (mic->STT->harness->TTS), foreground
@@ -307,6 +308,21 @@ cmd_logs() {
   tail -n 20 -f "$LOG_DIR/harness.log" "$LOG_DIR/bridge.log"
 }
 
+# Preflight self-check: verifies the whole stack (Ollama + required models,
+# harness + vault index, overlay backend, Google OAuth, web search, launchd
+# agents, formatter config) with a fix hint per line, and exits non-zero on a
+# hard failure. Deeper than `status`; safe to run anytime, and the check an
+# installer runs. Delegates to the harness module so it shares the server's
+# config + models.yaml source of truth.
+cmd_doctor() {
+  cd "$REPO_ROOT" && exec env \
+    SONAR_PORT="$HARNESS_PORT" \
+    SONAR_GLOW_PORT="$GLOW_PORT" \
+    SONAR_VAULT_PATH="$VAULT_PATH" \
+    SONAR_OLLAMA_URL="$OLLAMA_URL" \
+    uv run --project harness python -m sonar_harness.doctor "$@"
+}
+
 cmd_ask() {
   local q="$*"
   [ -n "$q" ] || { echo "usage: sonar.sh ask <question>" >&2; exit 1; }
@@ -495,6 +511,7 @@ main() {
     down)    cmd_down ;;
     restart) cmd_down; echo; cmd_up ;;
     status)  cmd_status ;;
+    doctor)  cmd_doctor "$@" ;;
     logs)    cmd_logs ;;
     ask)         cmd_ask "$@" ;;
     voice)       cmd_voice ;;
@@ -508,7 +525,7 @@ main() {
     ""|-h|--help|help)
       sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
     *)
-      echo "unknown command: $sub (try: up | down | restart | status | logs | ask | voice | google-auth | searxng | brief | daemon)" >&2
+      echo "unknown command: $sub (try: up | down | restart | status | doctor | logs | ask | voice | google-auth | searxng | brief | daemon)" >&2
       exit 1 ;;
   esac
 }
