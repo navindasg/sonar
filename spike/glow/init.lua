@@ -33,6 +33,7 @@ local GLOW = {
   wind      = _envnum("SONAR_GLOW_WIND", 0.80),          -- how hard the spikes wave 0..1
   len       = _envnum("SONAR_GLOW_LEN", 0.50),           -- spike length 0..1
   rain      = _envnum("SONAR_GLOW_RAIN", 0.80),          -- rainfall density 0..1 (0 = off)
+  grain     = _envbool("SONAR_GLOW_GRAIN", true),        -- film grit clipped inside the blades
   reactive  = _envbool("SONAR_GLOW_REACTIVE", true),     -- breathe + wave harder with mic level
   sweep     = _envstr("SONAR_GLOW_SWEEP", "listening"),  -- sonar rings: off|<state>|active|always
 }
@@ -64,7 +65,7 @@ end
 local M = {
   canvases = {}, ws = nil, animTimer = nil, screenWatcher = nil,
   animT = 0.0, visible = false, state = "idle", level = 0.0,
-  wsGen = 0, wsOpen = false,
+  wsGen = 0, wsOpen = false, grainImg = nil, grainN = 96,
   bar = nil, barUCC = nil, lastTyped = nil, committed = "",
   summoned = false, summonHideTimer = nil,
 }
@@ -142,6 +143,25 @@ local function bandFrame(ed, W, H, reach)
   else                            return { x=W-reach, y=0,       w=reach, h=H } end
 end
 
+-- A 96px black-to-grey grit tile, rendered once and reused. Painted over the blade
+-- fill (inside the clip) so the spikes read grainy without any dust on the desktop.
+local function makeGrainImage()
+  local N, cell = 96, 2
+  local gc = hs.canvas.new({ x=0, y=0, w=N, h=N })
+  local rng, els = makeRng(9973), {}
+  for yy = 0, N-1, cell do
+    for xx = 0, N-1, cell do
+      local v = rng() * (135/255)   -- black -> grey (never white)
+      els[#els + 1] = { type="rectangle", action="fill",
+        fillColor = { red=v, green=v, blue=v, alpha=1 }, frame = { x=xx, y=yy, w=cell, h=cell } }
+    end
+  end
+  local img
+  pcall(function() gc:replaceElements(els); img = gc:imageFromCanvas() end)
+  gc:delete()
+  return img, N
+end
+
 local function sweepActive()
   local s = GLOW.sweep
   if s == "always" then return true end
@@ -150,9 +170,12 @@ local function sweepActive()
   return M.state == s   -- e.g. the default "listening"
 end
 
--- Compose one screen's frame. Draw order is chosen so a SINGLE click-through
--- canvas yields, back-to-front: cave < edge light < blades < rings < rain —
--- using destinationOver to tuck the cave + edge glow behind the blades.
+-- Compose one screen's frame as a flat element list for one click-through canvas,
+-- drawn back-to-front: cave -> edge light -> rings -> rain, then the waving spikes
+-- LAST as a CLIP GROUP. hs.canvas ignores compositeRule masking on image/segments
+-- elements, so the only way to confine the dark blade fill AND the grit to the
+-- blade pixels is to build every blade path, `clip` to their union, then paint a
+-- tapered dark gradient + a grain tile — all of which land only inside the blades.
 local function buildScene(entry)
   local W, H, edges = entry.w, entry.h, entry.edges
   local t = M.animT
@@ -163,20 +186,68 @@ local function buildScene(entry)
   local react  = 0.75 + 0.45 * mic
   local breath = 0.92 + 0.08 * math.sin(t * 0.8)
   local maxLen   = 6 + GLOW.len * 40
-  local windAmp  = (5 + GLOW.wind * 24) * (0.7 + 0.5 * mic)
+  local windAmp  = (7 + GLOW.wind * 32) * (0.7 + 0.5 * mic)   -- tip sway = the visible "wind"
   local lenScale = (0.5 + veil * 0.7) * (0.85 + 0.3 * breath)
-  local flowT = t * 0.7
+  local flowT = t * 0.85
   local els = {}
 
-  -- (a) the waving spikes — one sinuous, tapered dark blade per segments element
-  local rootA = math.min(1, 1.25 * veil * intensity * react * breath)
+  -- (a) the dark cave depth hugging each edge (bottom layer)
+  local cA = math.min(1, 0.72 * veil * intensity)
   for _, ed in ipairs(edges) do
-    local grad = { { red=0.004, green=0.012, blue=0.024, alpha=rootA },
-                   { red=0.016, green=0.030, blue=0.047, alpha=0.0 } }
+    els[#els + 1] = { type="rectangle", action="fill",
+      fillGradient="linear", fillGradientAngle=ed.gAngle,
+      fillGradientColors={ { red=0.008, green=0.016, blue=0.027, alpha=cA },
+                           { red=0.008, green=0.016, blue=0.027, alpha=0.0 } },
+      frame=bandFrame(ed, W, H, 160) }
+  end
+
+  -- (b) blue/amber sonar light leaking in at the very edge, over the cave
+  local eA = 0.16 * intensity * react
+  for _, ed in ipairs(edges) do
+    els[#els + 1] = { type="rectangle", action="fill",
+      fillGradient="linear", fillGradientAngle=ed.gAngle,
+      fillGradientColors={ { red=hue[1], green=hue[2], blue=hue[3], alpha=eA },
+                           { red=hue[1], green=hue[2], blue=hue[3], alpha=0.0 } },
+      frame=bandFrame(ed, W, H, 55) }
+  end
+
+  -- (c) sonar rings — faint pings from a corner while listening
+  if GLOW.sweep ~= "off" and M.rings then
+    local ax, ay = W * 0.82, H * 0.20
+    local maxR = math.sqrt(W * W + H * H) * 0.38
+    for i = 1, SWEEP_SLOTS do
+      local rg = M.rings[i]
+      if rg and rg.active then
+        els[#els + 1] = { type="circle", center={ x=ax, y=ay }, radius=math.max(1, rg.age * maxR),
+          action="stroke", compositeRule="plusLighter", strokeWidth=2.0,
+          strokeColor=col(hue, (1 - rg.age) * 0.55 * intensity * react) }
+      end
+    end
+  end
+
+  -- (d) rain — faint state-coloured streaks drifting down
+  if GLOW.rain > 0 then
+    local n  = math.floor(GLOW.rain * 70)
+    local ra = 0.12 * intensity
+    for r = 0, n - 1 do
+      local base = ((r * 97.13) % 100) / 100
+      local spd  = 0.4 + ((r * 53.7) % 100) / 100 * 0.7
+      local ln   = 0.02 + ((r * 31.1) % 100) / 100 * 0.03
+      local yy = ((base + t * spd * 0.35) % 1.15) - 0.075
+      local xx = (base + t * spd * 0.08) % 1
+      local px, py = xx * W, yy * H
+      els[#els + 1] = { type="segments", action="stroke", strokeWidth=1.0, strokeColor=col(hue, ra),
+        coordinates={ { x=px, y=py }, { x=px - ln * W * 0.10, y=py - ln * H } } }
+    end
+  end
+
+  -- (e) the waving spikes, LAST, as a clip group. Build every blade's tapered,
+  --     undulating, wind-swayed path; the last one carries the `clip`; then a dark
+  --     taper fill + a grit tile paint ONLY inside the blade union.
+  local coordsList = {}
+  for _, ed in ipairs(edges) do
     for _, s in ipairs(ed.spikes) do
-      -- taper blades toward each corner (within ~4 spacings of the edge ends) so
-      -- the two edges meeting there don't pile into a heavy flame.
-      local ef = math.min(1, math.min(s.d, ed.len - s.d) / (SPACING * 4))
+      local ef = math.min(1, math.min(s.d, ed.len - s.d) / (SPACING * 4))   -- corner taper
       local len = maxLen * s.lenF * lenScale * (0.35 + 0.65 * ef)
       local sway = windAmp * math.sin(t - s.d * 0.011 + s.phase)
       local left, right = {}, {}
@@ -194,59 +265,43 @@ local function buildScene(entry)
         right[NS - k + 1] = { x=rx, y=ry }
       end
       for i = 1, #right do left[#left + 1] = right[i] end
-      els[#els + 1] = { type="segments", closed=true, action="fill",
-        fillGradient="linear", fillGradientColors=grad, fillGradientAngle=ed.gAngle,
-        coordinates=left }
+      coordsList[#coordsList + 1] = left
     end
   end
-
-  -- (b) blue/amber sonar light leaking in at the very edge, tucked BEHIND the blades
-  local eA = 0.16 * intensity * react
-  for _, ed in ipairs(edges) do
-    els[#els + 1] = { type="rectangle", action="fill", compositeRule="destinationOver",
-      fillGradient="linear", fillGradientAngle=ed.gAngle,
-      fillGradientColors={ { red=hue[1], green=hue[2], blue=hue[3], alpha=eA },
-                           { red=hue[1], green=hue[2], blue=hue[3], alpha=0.0 } },
-      frame=bandFrame(ed, W, H, 55) }
-  end
-
-  -- (c) the dark cave depth, behind everything, so the edges read heavy
-  local cA = math.min(1, 0.72 * veil * intensity)
-  for _, ed in ipairs(edges) do
-    els[#els + 1] = { type="rectangle", action="fill", compositeRule="destinationOver",
-      fillGradient="linear", fillGradientAngle=ed.gAngle,
-      fillGradientColors={ { red=0.008, green=0.016, blue=0.027, alpha=cA },
-                           { red=0.008, green=0.016, blue=0.027, alpha=0.0 } },
-      frame=bandFrame(ed, W, H, 160) }
-  end
-
-  -- (d) sonar rings — faint pings from a corner while listening (on top)
-  if GLOW.sweep ~= "off" and M.rings then
-    local ax, ay = W * 0.82, H * 0.20
-    local maxR = math.sqrt(W * W + H * H) * 0.38
-    for i = 1, SWEEP_SLOTS do
-      local rg = M.rings[i]
-      if rg and rg.active then
-        els[#els + 1] = { type="circle", center={ x=ax, y=ay }, radius=math.max(1, rg.age * maxR),
-          action="stroke", compositeRule="plusLighter", strokeWidth=2.0,
-          strokeColor=col(hue, (1 - rg.age) * 0.55 * intensity * react) }
+  local nb = #coordsList
+  if nb > 0 then
+    for i = 1, nb do
+      els[#els + 1] = { type="segments", closed=true,
+        action = (i < nb) and "build" or "clip", coordinates = coordsList[i] }
+    end
+    -- dark tapered blade fill (dark root -> transparent tip), clipped to the blades
+    local rootA = math.min(1, 1.2 * veil * intensity * react * breath)
+    local bladeReach = maxLen * lenScale * 1.3
+    for _, ed in ipairs(edges) do
+      els[#els + 1] = { type="rectangle", action="fill",
+        fillGradient="linear", fillGradientAngle=ed.gAngle,
+        fillGradientColors={ { red=0.004, green=0.012, blue=0.024, alpha=rootA },
+                             { red=0.016, green=0.030, blue=0.047, alpha=0.0 } },
+        frame=bandFrame(ed, W, H, bladeReach) }
+    end
+    -- grit tile, clipped to the blades -> grain lives IN the spikes, nowhere else
+    if GLOW.grain and M.grainImg then
+      local ga   = 0.30 * (0.55 + 0.55 * intensity)
+      local band = bladeReach + 12
+      local N    = M.grainN
+      local jit  = (math.floor(t * 10) % 4) * 3
+      local x = -jit
+      while x < W do
+        els[#els+1] = { type="image", image=M.grainImg, imageScaling="none", imageAlpha=ga, frame={ x=x, y=0,      w=N, h=band } }
+        els[#els+1] = { type="image", image=M.grainImg, imageScaling="none", imageAlpha=ga, frame={ x=x, y=H-band, w=N, h=band } }
+        x = x + N
       end
-    end
-  end
-
-  -- (e) rain — faint state-coloured streaks drifting down, topmost
-  if GLOW.rain > 0 then
-    local n  = math.floor(GLOW.rain * 70)
-    local ra = 0.12 * intensity
-    for r = 0, n - 1 do
-      local base = ((r * 97.13) % 100) / 100
-      local spd  = 0.4 + ((r * 53.7) % 100) / 100 * 0.7
-      local ln   = 0.02 + ((r * 31.1) % 100) / 100 * 0.03
-      local yy = ((base + t * spd * 0.35) % 1.15) - 0.075
-      local xx = (base + t * spd * 0.08) % 1
-      local px, py = xx * W, yy * H
-      els[#els + 1] = { type="segments", action="stroke", strokeWidth=1.0, strokeColor=col(hue, ra),
-        coordinates={ { x=px, y=py }, { x=px - ln * W * 0.10, y=py - ln * H } } }
+      local y = -jit
+      while y < H do
+        els[#els+1] = { type="image", image=M.grainImg, imageScaling="none", imageAlpha=ga, frame={ x=0,      y=y, w=band, h=N } }
+        els[#els+1] = { type="image", image=M.grainImg, imageScaling="none", imageAlpha=ga, frame={ x=W-band, y=y, w=band, h=N } }
+        y = y + N
+      end
     end
   end
 
@@ -778,6 +833,7 @@ end
 
 local function start()
   pcall(require, "hs.ipc")   -- enable the `hs -c` CLI port (for headless driving)
+  M.grainImg, M.grainN = makeGrainImage()   -- render the grit tile once, before layout
   layout()
   M.screenWatcher = hs.screen.watcher.new(layout):start()
   -- Auto-reload when init.lua is edited (handy while iterating on the look).
@@ -833,7 +889,7 @@ sonarGlow = {
   status = function()
     return hs.inspect({
       visible = M.visible, state = M.state, level = M.level, screens = #M.canvases,
-      ws_connected = M.ws ~= nil, ws_open = M.wsOpen, bar = M.bar ~= nil,
+      ws_connected = M.ws ~= nil, ws_open = M.wsOpen, grain = M.grainImg ~= nil, bar = M.bar ~= nil,
       lastTyped = M.lastTyped, rxCount = M.rxCount or 0, lastRx = M.lastRx, rxTranscript = M.rxTranscript,
     })
   end,
@@ -851,11 +907,12 @@ sonarGlow = {
     if not e then M.state, M.level = prevState, prevLevel; return "no-canvas" end
     local okr = pcall(function() e.c:replaceElements(buildScene(e)) end)
     if okr and bg then
-      pcall(function() e.c:appendElements({ type="rectangle", action="fill",
-        compositeRule="destinationOver", fillGradient="linear", fillGradientAngle=135,
+      -- insert at the BOTTOM (index 1) so the spikes' clip group can't mask it away
+      pcall(function() e.c:insertElement({ type="rectangle", action="fill",
+        fillGradient="linear", fillGradientAngle=135,
         fillGradientColors={ { red=0.10, green=0.14, blue=0.20, alpha=1 },
                              { red=0.03, green=0.05, blue=0.09, alpha=1 } },
-        frame={ x=0, y=0, w=e.w, h=e.h } }) end)
+        frame={ x=0, y=0, w=e.w, h=e.h } }, 1) end)
     end
     local img = okr and e.c:imageFromCanvas() or nil
     -- restore shared state AND re-render the real canvas clean (no mock-bg rect)
