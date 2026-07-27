@@ -57,6 +57,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 from collections import deque
 from typing import Any, AsyncIterator
@@ -77,7 +78,6 @@ from echo_gate import EchoGate  # noqa: E402
 from acks import next_ack  # noqa: E402
 from harness_client import DELTA, STEP, stream_turn  # noqa: E402
 from history import append_turn  # noqa: E402
-from notes import session as notes_session  # noqa: E402
 from notes.controller import NotesController  # noqa: E402
 from notes.intent import notes_title_hint, wants_notes_start  # noqa: E402
 
@@ -85,6 +85,66 @@ log = logging.getLogger("sonar.voice")
 
 HOST = os.environ.get("SONAR_GLOW_HOST", "127.0.0.1")
 PORT = int(os.environ.get("SONAR_GLOW_PORT", "8770"))
+
+# ---- who may drive this socket ----------------------------------------------
+# WebSockets are exempt from the browser's same-origin policy, so without an
+# explicit check any page the user visits could open ws://127.0.0.1:8770 and send
+# {"cmd":"start"} — mic on, with NOTHING on screen, because the listening ack
+# goes only to the sender — or {"cmd":"say"} to speak through the speakers. The
+# notes server on :8771 already gates this; the same gate belongs here.
+#
+# KNOWN GAP: a client that sends no Origin at all is allowed, because
+# Hammerspoon's hs.websocket and scripts/morning_brief.py send none. That means
+# this stops hostile WEB PAGES, not another process running as the user. Closing
+# that needs a shared token both the overlay and the loop read.
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
+
+
+def allowed_origins(port: int = PORT) -> set[str]:
+    """The exact local origins allowed to hand shake, on the bound port."""
+    return {f"http://{host}:{port}" for host in _LOOPBACK_HOSTS}
+
+
+def serve_origins() -> list:
+    """``origins=`` for websockets.serve: a loopback regex backstop (any port —
+    the bound port isn't known here) plus None for clients that send no Origin.
+    The exact per-port check is origin_allowed(), applied in the handshake."""
+    hosts = "|".join(re.escape(h) for h in _LOOPBACK_HOSTS)
+    return [re.compile(rf"http://(?:{hosts})(?::\d+)?"), None]
+
+
+def origin_allowed(headers: Any, port: int = PORT) -> bool:
+    """True for our own local origins, or a client sending no Origin. A
+    malformed or duplicated Origin header is refused."""
+    try:
+        origin = headers.get("Origin")
+    except Exception:  # noqa: BLE001 — malformed/duplicate Origin: refuse
+        return False
+    if origin is None:
+        return True
+    return origin in allowed_origins(port)
+
+
+def make_origin_gate(port: int = PORT):
+    """A ``process_request`` for websockets.serve that refuses a cross-origin
+    handshake BEFORE accept(). Returns None to let a connection through."""
+
+    def gate(_conn: Any, request: Any) -> Any:
+        if origin_allowed(request.headers, port):
+            return None
+        from http import HTTPStatus
+
+        from websockets.datastructures import Headers
+        from websockets.http11 import Response
+
+        log.warning("refused cross-origin websocket on :%d", port)
+        return Response(
+            HTTPStatus.FORBIDDEN, "Forbidden",
+            Headers([("Content-Type", "text/plain")]),
+            b"cross-origin websocket refused\n",
+        )
+
+    return gate
 HARNESS_URL = os.environ.get("SONAR_HARNESS_URL", "http://127.0.0.1:8787").rstrip("/")
 OLLAMA_URL = os.environ.get("SONAR_OLLAMA_URL", "http://127.0.0.1:11434")
 VAULT_PATH = os.environ.get(
@@ -453,17 +513,24 @@ class VoiceLoop:
             await self._speak_text(ws, f"Sorry, I couldn't open the notes window. {exc}")
 
     async def _on_notes_done(self) -> None:
-        """Notes session left recording (ended or discarded): hand the mic back."""
+        """Notes session left recording (ended or discarded): hand the mic back.
+
+        Deliberately SILENT. This used to speak "Done taking notes…" through
+        Kokoro, which is Sonar talking to the user when he isn't interacting with
+        it — and it fired precisely when the overlay was closed. Worse, the end
+        can be triggered by ANY speaker in the room: ``notes/controller.py`` runs
+        ``wants_notes_stop()`` over every transcribed utterance, so a meeting
+        participant's phrasing made Sonar talk into a live call. Same shape as
+        the 2026-07-24 morning-brief incident.
+
+        Nothing is lost: ``end()`` broadcasts the session state, and the notes
+        window renders REVIEW off that on its own.
+        """
         if not self.listening:
             self.stop_mic()  # overlay is closed; don't leave the mic hot
         self.endpointer.reset()
         if self.silero is not None:
             self.silero.reset_states()
-        state = self.notes.state if self.notes is not None else None
-        if state is not None and state.status == notes_session.REVIEW:
-            self._start_say(
-                self._notes_ws, "Done taking notes. Review and save them in the notes window."
-            )
 
     # ---- response: harness turn -> box + TTS ----
     def _start_response(self, ws, text: str) -> None:
@@ -689,8 +756,12 @@ async def main() -> None:
     )
     loop = VoiceLoop()
     await loop.load()
+
     try:
-        async with websockets.serve(loop.handler, HOST, PORT):
+        async with websockets.serve(
+            loop.handler, HOST, PORT,
+            origins=serve_origins(), process_request=make_origin_gate(PORT),
+        ):
             print(f"[voice] serving ws://{HOST}:{PORT}; Ctrl-C to stop", flush=True)
             await asyncio.Future()
     finally:
