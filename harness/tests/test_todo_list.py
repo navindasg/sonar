@@ -87,3 +87,27 @@ def test_skips_obsidian_machinery(tmp_path):
 def test_invalid_filter_is_rejected(tmp_path):
     _write(tmp_path, "n.md", "- [ ] x\n")
     assert _tool(tmp_path).run({"due": "yesterday"}, _ctx()[0]).startswith("error:")
+
+
+def test_a_commitment_the_user_made_in_a_meeting_counts_as_theirs(tmp_path):
+    """Sonar TRANSCRIBED the meeting note, but the commitment in it is the
+    user's own — so it has to survive the source='user' filter daily.brief
+    applies, or a to-do they said out loud can never reach their brief."""
+    _write(
+        tmp_path,
+        "Sonar/Notes/standup-with-dana.md",
+        "## My Action Items\n\n- [ ] ship the parser 📅 2026-07-08\n",
+    )
+    _write(tmp_path, "Sonar/Briefs/2026-07-06-any.md", "- [ ] follow up on the brief\n")
+    out = json.loads(_tool(tmp_path).run({"source": "user"}, _ctx()[0]))
+    assert [t["task"] for t in out["todos"]] == ["ship the parser 📅 2026-07-08"]
+
+
+def test_sonars_own_writing_outside_notes_is_still_sonars(tmp_path):
+    """The carve-out is exactly Sonar/Notes/. Everything else Sonar authors —
+    briefs, reviews, note.capture's Sonar/<slug>.md — stays 'sonar', so the
+    brief can't start quoting its own artifacts back at the user."""
+    _write(tmp_path, "Sonar/Review/2026-W28.md", "- [ ] a review leftover\n")
+    _write(tmp_path, "Sonar/Inbox.md", "- [ ] a captured idea\n")
+    out = json.loads(_tool(tmp_path).run({"source": "sonar"}, _ctx()[0]))
+    assert {t["task"] for t in out["todos"]} == {"a review leftover", "a captured idea"}

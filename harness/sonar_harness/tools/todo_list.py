@@ -13,7 +13,9 @@ them:
                  (it is told today's date via the prompt's <clock> block).
   * ``source`` — ``sonar`` if the note is one Sonar generated (under ``Sonar/``)
                  vs ``user`` for the user's own notes, so the assistant never
-                 confuses what it wrote with what the user wrote.
+                 confuses what it wrote with what the user wrote. Meeting notes
+                 (``Sonar/Notes/``) count as the user's: Sonar transcribed them,
+                 the user made the commitment.
   * ``note`` / ``line`` — provenance.
 
 Read-only; the vault stays the single source of truth (no DB copy). Filtering is
@@ -47,6 +49,15 @@ _SKIP_DIRS = frozenset({".obsidian", ".trash", ".git", ".sonar"})
 # Notes Sonar itself authors live under this top-level vault folder.
 _SONAR_DIR = "Sonar"
 
+# ...with ONE carve-out. Sonar/Notes/ holds meeting notes Sonar transcribed, and
+# a commitment the user made out loud in a meeting is the user's own to-do —
+# Sonar only wrote it down. Classing those as 'sonar' would hide them from the
+# source='user' filter daily.brief uses, so a task they actually said could never
+# reach their brief. Only the "## My Action Items" section of such a note renders
+# as a checkbox (voice/notes/summarize.py keeps the other attendees' items as
+# plain bullets), so this cannot enroll a colleague's task in the user's list.
+_USER_AUTHORED_IN_SONAR = ("Notes",)
+
 _DUE_FILTERS = ("all", "today", "overdue", "upcoming", "dated", "undated")
 _SOURCE_FILTERS = ("all", "user", "sonar")
 
@@ -64,8 +75,16 @@ def _task_date(text: str, note: str) -> str | None:
 
 
 def _source_of(note: str) -> str:
-    """'sonar' for notes Sonar generated (under Sonar/), else 'user'."""
-    return "sonar" if note == _SONAR_DIR or note.startswith(_SONAR_DIR + "/") else "user"
+    """'sonar' for notes Sonar generated (under Sonar/), else 'user'.
+
+    Sonar/Notes/ is 'user': Sonar transcribed it, the user said it (see
+    ``_USER_AUTHORED_IN_SONAR``).
+    """
+    if note != _SONAR_DIR and not note.startswith(_SONAR_DIR + "/"):
+        return "user"
+    inside = note[len(_SONAR_DIR) + 1:]
+    folder = inside.split("/", 1)[0] if "/" in inside else ""
+    return "user" if folder in _USER_AUTHORED_IN_SONAR else "sonar"
 
 
 def _scan_open_todos(vault: Path) -> list[dict[str, Any]]:
