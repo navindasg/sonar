@@ -35,6 +35,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+from typing import Any
 
 import httpx
 import websockets
@@ -47,6 +49,67 @@ HARNESS_URL = os.environ.get("SONAR_HARNESS_URL", "http://127.0.0.1:8787").rstri
 
 _SSE_DATA_PREFIX = "data: "
 _SSE_DONE = "[DONE]"
+
+# WebSockets are exempt from the browser's same-origin policy, so without an
+# explicit check any page the user visits could open ws://127.0.0.1:8770 and send
+# {"text": "..."} — which runs a FULL harness turn as the user, with their Gmail,
+# Calendar, drafts and Obsidian vault behind it, and streams the answer straight
+# back to that page. Nothing shows on screen either, because every reply goes
+# only to the sender. The voice loop binds this same port when voice is running
+# and already gates it; the typed path needs the identical gate.
+#
+# KNOWN GAP: a client that sends no Origin at all is allowed, because
+# Hammerspoon's hs.websocket sends none. That means this stops hostile WEB
+# PAGES, not another process running as the user. Closing that needs a shared
+# token both the overlay and the bridge read.
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
+
+
+def allowed_origins(port: int = PORT) -> set[str]:
+    """The exact local origins allowed to hand shake, on the bound port."""
+    return {f"http://{host}:{port}" for host in _LOOPBACK_HOSTS}
+
+
+def serve_origins() -> list:
+    """``origins=`` for websockets.serve: a loopback regex backstop (any port —
+    the bound port isn't known here) plus None for clients that send no Origin.
+    The exact per-port check is origin_allowed(), applied in the handshake."""
+    hosts = "|".join(re.escape(h) for h in _LOOPBACK_HOSTS)
+    return [re.compile(rf"http://(?:{hosts})(?::\d+)?"), None]
+
+
+def origin_allowed(headers: Any, port: int = PORT) -> bool:
+    """True for our own local origins, or a client sending no Origin. A
+    malformed or duplicated Origin header is refused."""
+    try:
+        origin = headers.get("Origin")
+    except Exception:  # noqa: BLE001 — malformed/duplicate Origin: refuse
+        return False
+    if origin is None:
+        return True
+    return origin in allowed_origins(port)
+
+
+def make_origin_gate(port: int = PORT):
+    """A ``process_request`` for websockets.serve that refuses a cross-origin
+    handshake BEFORE accept(). Returns None to let a connection through."""
+
+    def gate(_conn: Any, request: Any) -> Any:
+        if origin_allowed(request.headers, port):
+            return None
+        from http import HTTPStatus
+
+        from websockets.datastructures import Headers
+        from websockets.http11 import Response
+
+        log.warning("refused cross-origin websocket on :%d", port)
+        return Response(
+            HTTPStatus.FORBIDDEN, "Forbidden",
+            Headers([("Content-Type", "text/plain")]),
+            b"cross-origin websocket refused\n",
+        )
+
+    return gate
 
 
 def sse_delta(line: str) -> str | None:
@@ -147,7 +210,10 @@ async def main() -> None:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
     log.info("bridge -> harness %s ; serving overlay ws://%s:%d", HARNESS_URL, HOST, PORT)
-    async with websockets.serve(handler, HOST, PORT):
+    async with websockets.serve(
+        handler, HOST, PORT,
+        origins=serve_origins(), process_request=make_origin_gate(PORT),
+    ):
         await asyncio.Future()
 
 
