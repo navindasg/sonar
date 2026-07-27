@@ -18,8 +18,13 @@ note.capture: local
 state_read: local
 # External inputs (read-only). gmail/calendar read the user's own account via
 # per-user OAuth; web.search is the one capability that leaves the machine. All
-# read-only, so auto-run inside a voice turn. (Draft/send email will be `gated`.)
+# read-only, so auto-run inside a voice turn.
 gmail.search: local
+# gmail.draft SAVES a draft and structurally cannot send (see gmail_draft.py);
+# inert until a human presses Send in Gmail, so it runs inside a voice turn.
+# Do NOT mark it `gated`: _is_visible hides gated tools from the model AND
+# refuses them at dispatch, which would delete the capability, not protect it.
+gmail.draft: local
 calendar.agenda: local
 # calendar.create/reschedule/cancel WRITE to the user's own calendar — kept local
 # (low-consequence, reversible: a move can move back, a delete lands in Trash) so
@@ -27,6 +32,11 @@ calendar.agenda: local
 calendar.create: local
 calendar.reschedule: local
 calendar.cancel: local
-# daily.brief composes read-only agenda + todos (+ optional email); read-only.
+# The composed tools fan out over the read-only tools above; the only thing they
+# write is their own dated artifact under the vault's Sonar/ folder.
 daily.brief: local
+weekly.review: local
+# meeting.prep writes nothing at all — it recomposes on every ask, because a
+# meeting's context moves right up to the minute it starts.
+meeting.prep: local
 web.search: local

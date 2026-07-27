@@ -7,16 +7,21 @@ account / domain-wide delegation (the only Google auth path that needs a
 Workspace super-admin). For a personal ``@gmail.com`` there is no tenant and no
 admin at all.
 
-Scopes are READ-ONLY (``gmail.readonly`` + ``calendar.readonly``). Draft/send is
-a separate, human-gated capability (DECISIONS: email is draft-only, never
-auto-sent) and is not wired here.
+Gmail is READ-ONLY plus ``gmail.compose`` (create DRAFTS). Sonar has no tool that
+sends mail — email stays draft-only, never auto-sent (DECISIONS) — and that is
+enforced in code, not by the scope: Google offers no "drafts but not send" scope,
+so ``gmail.compose`` is simply the narrowest scope that can save a draft at all.
+Calendar uses ``calendar.events``.
 
 --------------------------------------------------------------------------------
 ONE-TIME SETUP (Navin — no admin needed):
   1. Google Cloud Console -> create a project (personal; free).
   2. "APIs & Services" -> Library -> enable "Gmail API" and "Google Calendar API".
   3. "OAuth consent screen" -> User type EXTERNAL -> fill app name + your email.
-       Add yourself under "Test users". Add scopes gmail.readonly + calendar.readonly.
+       Add yourself under "Test users". Add scopes gmail.readonly + gmail.compose
+       + calendar.events. (gmail.compose is a "restricted" scope: Google shows a
+       verification notice when you add it — for your own account you can proceed
+       and click through the one-time "unverified app" screen at consent.)
        IMPORTANT: click "PUBLISH APP" (set publishing status to "In production").
        In "Testing" status Google expires the refresh token after 7 days; "In
        production" for your own account just shows a one-time "unverified app"
@@ -36,20 +41,39 @@ rather than crashing the turn.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
+from typing import Iterable
 
 log = logging.getLogger("sonar.google")
 
-# The token is granted ALL of these at consent; every tool loads with the full
-# set so a refresh never trips a scope-change error. Gmail stays READ-ONLY
-# (draft/send is a later human-gated capability). Calendar uses `calendar.events`
-# = read AND write events (Navin asked to create events); it does NOT grant
-# access to calendar settings/sharing or other Google data.
-DEFAULT_SCOPES: tuple[str, ...] = (
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/calendar.events",
+GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
+CALENDAR_EVENTS_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+
+# FALLBACK scopes, used only when the stored token doesn't record its own (see
+# `load_scopes`, which is what credentials are actually built with). This is the
+# historical read-only-Gmail set on purpose: it is the grant any token predating
+# `gmail.compose` carries, and requesting a scope that was never granted is what
+# makes google-auth complain at refresh (older versions raise outright).
+DEFAULT_SCOPES: tuple[str, ...] = (GMAIL_READONLY_SCOPE, CALENDAR_EVENTS_SCOPE)
+
+# Scopes requested at CONSENT — a superset of the floor. `gmail.compose` lets
+# Sonar SAVE DRAFTS (gmail.draft). Google has no draft-without-send scope, so
+# "never sends" is guaranteed by Sonar's code (there is no send call anywhere in
+# the harness), not by the grant. `calendar.events` = read AND write events; it
+# does NOT grant calendar settings/sharing or any other Google data.
+CONSENT_SCOPES: tuple[str, ...] = (*DEFAULT_SCOPES, GMAIL_COMPOSE_SCOPE)
+
+# Scopes that permit creating a Gmail draft. Sonar only ever REQUESTS the first
+# (narrowest) one, but accepts a broader grant a token may already carry rather
+# than forcing a pointless re-consent.
+GMAIL_DRAFT_CAPABLE_SCOPES: tuple[str, ...] = (
+    GMAIL_COMPOSE_SCOPE,
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://mail.google.com/",
 )
 
 
@@ -75,6 +99,73 @@ _NOT_CONNECTED = (
     "Google is not connected yet. Run `scripts/sonar.sh google-auth` once to "
     "sign in (see harness/sonar_harness/google_auth.py for the one-time setup)."
 )
+
+
+def granted_scopes() -> frozenset[str]:
+    """Scopes the STORED token actually carries (empty when unreadable/absent).
+
+    Read from the token file, not from the constants above: the constants say
+    what Sonar *asks* for, and a token minted before a scope was added still
+    holds the older, smaller grant. Only the file knows what the user really
+    approved — which is what lets a tool say "re-run google-auth" up front
+    instead of letting Google answer a doomed request with a bare 403.
+    """
+    path = _token_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return frozenset()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        log.warning("could not read scopes from token %s (%s)", path, exc)
+        return frozenset()
+    scopes = data.get("scopes") if isinstance(data, dict) else None
+    if isinstance(scopes, str):  # some writers store them space-separated
+        scopes = scopes.split()
+    if not isinstance(scopes, list):
+        return frozenset()
+    return frozenset(str(s) for s in scopes if isinstance(s, str))
+
+
+def require_any_scope(scopes: Iterable[str], *, capability: str) -> None:
+    """Raise ``GoogleAuthError`` unless the stored grant includes one of ``scopes``.
+
+    ``capability`` is a plain-language verb phrase ("save Gmail drafts") that
+    goes into the message, so the model can tell the user what to re-approve and
+    why — a scope URL alone is not actionable to a person listening out loud.
+    """
+    accepted = tuple(scopes)
+    if not accepted:  # programming error: an empty gate would silently pass
+        raise ValueError("require_any_scope needs at least one acceptable scope")
+    if not _token_path().exists():
+        raise GoogleAuthError(_NOT_CONNECTED)
+    if granted_scopes() & frozenset(accepted):
+        return
+    raise GoogleAuthError(
+        f"Sonar's Google sign-in doesn't include permission to {capability} yet. "
+        "Re-run `scripts/sonar.sh google-auth` and approve the extra permission "
+        f"({accepted[0]}); the existing read access keeps working either way."
+    )
+
+
+def load_scopes() -> list[str]:
+    """The scope list to construct ``Credentials`` with — read from the TOKEN.
+
+    Not a constant, and that is the whole point. google-auth passes these as the
+    OAuth ``scope`` parameter on every refresh, and per RFC 6749 §6 a refresh
+    request narrows the access token it mints (``refresh_grant``'s own docstring:
+    "if present, all scopes must be authorized for the refresh token"). So a
+    hardcoded list here is not a floor, it is a ceiling: pinning it below what
+    the user actually approved would silently un-grant ``gmail.compose`` at the
+    first refresh — drafts would work for about an hour after consent and then
+    403 forever, which reads as "Sonar is broken", not "re-consent".
+
+    Mirroring the token also preserves the property the old constant was
+    protecting: we never request a scope the grant lacks, so a token minted
+    before a scope existed keeps refreshing untouched. ``DEFAULT_SCOPES`` is the
+    fallback for a token file that doesn't record its scopes.
+    """
+    stored = granted_scopes()
+    return sorted(stored) if stored else list(DEFAULT_SCOPES)
 
 
 def _save_token(creds: object) -> None:
@@ -107,7 +198,7 @@ def load_credentials():
     if not token.exists():
         raise GoogleAuthError(_NOT_CONNECTED)
 
-    creds = Credentials.from_authorized_user_file(str(token), list(DEFAULT_SCOPES))
+    creds = Credentials.from_authorized_user_file(str(token), load_scopes())
     if creds.valid:
         return creds
     if creds.expired and creds.refresh_token:
@@ -154,7 +245,9 @@ def run_consent() -> None:
             "OAuth client in Google Cloud Console and save its JSON there "
             "(see this module's docstring for the exact zero-admin steps)."
         )
-    flow = InstalledAppFlow.from_client_secrets_file(str(secret), list(DEFAULT_SCOPES))
+    # CONSENT_SCOPES, not DEFAULT_SCOPES: consent is the one moment we can ask
+    # for more than the token already has (see the constants above).
+    flow = InstalledAppFlow.from_client_secrets_file(str(secret), list(CONSENT_SCOPES))
     creds = flow.run_local_server(port=0, open_browser=True)
     _save_token(creds)
     print(f"[google] connected; token saved to {_token_path()}", flush=True)
