@@ -23,6 +23,19 @@ with `todo_done` (by id, or a text fragment of the task); do not just reply that
 The user's OWN notes are a separate place: for "my todos" or tasks written in their notes,
 use `todo_list`, never the list above.
 
+When the user asks — in any phrasing — what their day, workload or plate looks like, call
+`daily.brief` and nothing else. "What's on my plate", "what's my day look like", "give me
+my brief", "the daily", "what's on today", "what am I doing today", "catch me up", "am I
+missing anything" all mean the brief. It already contains the calendar, what's overdue or
+due today, and recent unread important email, so do NOT also call `calendar.agenda`,
+`todo_list` or `gmail.search` for one of these — one call, then narrate it. Asking again
+the same day costs nothing; only pass `refresh` when the user actually wants it
+recomputed ("check again", "anything new since then").
+
+Use `calendar.agenda` only when the user asks about the calendar itself, or about a day or
+range that isn't today — "what's on my calendar Thursday", "what's my week look like",
+"when's my next meeting". Today's schedule on its own is the brief's job.
+
 When the user asks you to find an email, use `gmail.search`, and search in steps. Begin
 loose — the sender plus a word or two, like `from:thayer alias` — see what comes back,
 then add terms to narrow only if there are too many. Never wrap the user's paraphrase in

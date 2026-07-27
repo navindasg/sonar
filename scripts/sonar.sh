@@ -418,10 +418,13 @@ PY
 # Morning brief: fetch daily.brief from the harness, save a vault note, speak it
 # (if the voice loop is up). `run` does it once; `install`/`uninstall` manage the
 # 08:00 launchd schedule.
+# The brief is PULL-only: you run it, it never runs itself. It speaks aloud when
+# the voice loop is up, so there is deliberately NO way to schedule it any more —
+# the old `brief install` agent (and the harness scheduler's brief job) read the
+# user's day out loud, unprompted, into a live meeting on 2026-07-24. Just asking
+# Sonar "what's on my plate" hits the same brief without any of that.
 cmd_brief() {
   local action="${1:-run}"
-  local plist_src="$REPO_ROOT/scripts/launchd/com.sonar.morning-brief.plist"
-  local plist_dst="$HOME/Library/LaunchAgents/com.sonar.morning-brief.plist"
   case "$action" in
     run|"")
       _port_up "$HARNESS_PORT" || { echo "harness not running — 'sonar.sh up' first." >&2; exit 1; }
@@ -432,22 +435,13 @@ cmd_brief() {
         PYTHONUNBUFFERED=1 \
         uv run scripts/morning_brief.py
       ;;
-    install)
-      mkdir -p "$LOG_DIR" "$HOME/Library/LaunchAgents"
-      sed -e "s|__SONAR_SH__|${SONAR_SH}|g" -e "s|__LOGDIR__|${LOG_DIR}|g" \
-        "$plist_src" > "$plist_dst"
-      launchctl unload "$plist_dst" 2>/dev/null || true
-      launchctl load "$plist_dst"
-      echo "morning brief scheduled daily at 08:00 (com.sonar.morning-brief)."
-      echo "  plist: $plist_dst"
-      echo "  note: keep the harness (+ voice loop for audio) running at 08:00."
+    install|uninstall)
+      echo "scheduling the brief was removed — it speaks aloud, so it is pull-only now." >&2
+      echo "  run it yourself:  sonar.sh brief" >&2
+      echo "  or just ask:      \"what's on my plate\"" >&2
+      exit 1
       ;;
-    uninstall)
-      launchctl unload "$plist_dst" 2>/dev/null || true
-      rm -f "$plist_dst"
-      echo "morning brief schedule removed."
-      ;;
-    *) echo "usage: sonar.sh brief [run|install|uninstall]" >&2; exit 1 ;;
+    *) echo "usage: sonar.sh brief [run]" >&2; exit 1 ;;
   esac
 }
 

@@ -80,6 +80,6 @@ def default_tools(*, rag_backend: RagBackend, vault_path: str) -> list[ToolBase]
         CalendarCreateTool(),
         CalendarRescheduleTool(),
         CalendarCancelTool(),
-        DailyBriefTool(vault_path=vault_path),  # composes agenda + todos (+ email)
+        DailyBriefTool(vault_path=vault_path),  # agenda + todos + email, cached per day
         WebSearchTool(),
     ]

@@ -1,5 +1,9 @@
 """Catch-up scheduler: tick semantics (due + not-done → run, idempotent,
-failure-isolated) and the brief/formatter job predicates."""
+failure-isolated) and the formatter job predicates.
+
+The scheduler is deliberately SILENT: it only runs fire-and-forget note
+formatting. The morning brief used to live here and spoke itself aloud through
+the voice loop — see test_no_scheduled_job_can_speak."""
 
 from __future__ import annotations
 
@@ -12,7 +16,6 @@ import pytest
 from sonar_harness import scheduler
 from sonar_harness.scheduler import (
     Job,
-    brief_job,
     default_jobs,
     ensure_formatter_config,
     formatter_daily_job,
@@ -22,7 +25,6 @@ from sonar_harness.scheduler import (
 )
 
 NOON = datetime(2026, 7, 20, 12, 0)
-SEVEN_AM = datetime(2026, 7, 20, 7, 0)
 
 
 def _counter_job(name: str, *, due: bool, done: bool, boom: bool = False) -> tuple[Job, list[int]]:
@@ -66,24 +68,6 @@ def test_tick_isolates_a_failing_job() -> None:
     ran = tick([bad, good], NOON)           # bad raises, good still runs
     assert ran == ["good"]
     assert cb == [1] and cg == [1]
-
-
-# ---- brief job ---------------------------------------------------------------
-def test_brief_due_only_after_target(tmp_path: Path) -> None:
-    job = brief_job(repo_root=tmp_path, vault_path=tmp_path, hour=8, minute=0)
-    assert job.due(NOON) is True
-    assert job.due(SEVEN_AM) is False
-
-
-def test_brief_done_when_todays_note_exists(tmp_path: Path) -> None:
-    job = brief_job(repo_root=tmp_path, vault_path=tmp_path, hour=8, minute=0)
-    assert job.done(NOON) is False
-    note = tmp_path / "Sonar" / "Brief" / "2026-07-20.md"
-    note.parent.mkdir(parents=True)
-    note.write_text("# brief", encoding="utf-8")
-    assert job.done(NOON) is True
-    # a note for a different day does not satisfy today
-    assert job.done(datetime(2026, 7, 21, 12, 0)) is False
 
 
 # ---- formatter job -----------------------------------------------------------
@@ -157,10 +141,21 @@ def test_formatter_jobs_pass_the_managed_config(
 
 
 # ---- default_jobs / start_scheduler -----------------------------------------
-def test_default_jobs_are_brief_and_formatter(tmp_path: Path) -> None:
+def test_default_jobs_are_formatter_only(tmp_path: Path) -> None:
     # Formatter is always scheduled — it's Sonar's own vendored obsidian_rag.
     names = [j.name for j in default_jobs(vault_path=tmp_path)]
-    assert names == ["brief", "formatter-daily", "formatter-tags"]
+    assert names == ["formatter-daily", "formatter-tags"]
+
+
+def test_no_scheduled_job_can_speak(tmp_path: Path) -> None:
+    """REGRESSION GUARD (2026-07-24 hot-mic incident): the scheduler ran the
+    morning brief, which pushes `say` to the voice loop and reads it aloud —
+    unprompted, into a live meeting. The brief is PULL-only now. Nothing the
+    scheduler runs may reach sonar.sh brief / the :8770 voice socket again.
+    """
+    for job in default_jobs(vault_path=tmp_path):
+        assert "brief" not in job.name
+    assert not hasattr(scheduler, "brief_job")
 
 
 def test_formatter_uses_harness_interpreter_by_default(tmp_path: Path) -> None:
@@ -174,8 +169,3 @@ def test_start_scheduler_disabled_returns_none(monkeypatch: pytest.MonkeyPatch) 
     assert start_scheduler(vault_path="/tmp") is None
 
 
-def test_brief_hour_configurable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SONAR_BRIEF_HOUR", "6")
-    brief = next(j for j in default_jobs(vault_path=tmp_path) if j.name == "brief")
-    assert brief.due(datetime(2026, 7, 20, 6, 30)) is True
-    assert brief.due(datetime(2026, 7, 20, 5, 30)) is False
