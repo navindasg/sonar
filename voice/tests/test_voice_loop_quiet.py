@@ -54,14 +54,13 @@ def _done_loop(*, status: str, listening: bool) -> tuple[VoiceLoop, list[str]]:
     vl.listening = listening
     vl.endpointer = _Recorder()
     vl.silero = _Recorder()
-    vl._notes_ws = object()
     vl._response_task = None
     vl.stopped_mic = False
 
     def _stop_mic() -> None:
         vl.stopped_mic = True
 
-    def _start_say(_ws, text: str) -> None:
+    def _start_say(text: str) -> None:
         said.append(text)
 
     vl.stop_mic = _stop_mic

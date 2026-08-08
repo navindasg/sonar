@@ -18,10 +18,10 @@
 # ///
 """Sonar voice loop (I0) — press F5, speak, hear a vault-grounded answer.
 
-This is the integration that closes the loop the two spikes left open:
-``voice/stt_bridge.py`` proved mic -> STT -> box, and ``overlay/bridge.py``
-proved typed -> harness -> box. This joins them and adds the missing edge —
-answer -> TTS -> speaker — so one F5 press runs the whole turn:
+This is the integration that closes the loop the two spikes left open: an STT
+spike proved mic -> STT -> box, and ``overlay/bridge.py`` proved typed ->
+harness -> box. This joins them and adds the missing edge — answer -> TTS ->
+speaker — so one F5 press runs the whole turn:
 
     F5/start  -> mic on, live partials fill the box
     turn end  -> final transcript -> harness /v1 (tool loop, grounded answer)
@@ -58,6 +58,7 @@ import logging
 import os
 import random
 import re
+import signal
 import sys
 from collections import deque
 from typing import Any, AsyncIterator
@@ -125,24 +126,60 @@ def origin_allowed(headers: Any, port: int = PORT) -> bool:
     return origin in allowed_origins(port)
 
 
+def is_websocket_upgrade(headers: Any) -> bool:
+    """True only for a real handshake: Connection carries an ``upgrade`` token
+    AND Upgrade is ``websocket``. Those are the two things accept() checks (in
+    that order) before it raises; anything else is a plain HTTP request."""
+    try:
+        connection = headers.get("Connection") or ""
+        upgrade = headers.get("Upgrade") or ""
+    except Exception:  # noqa: BLE001 — malformed/duplicate headers: not a handshake
+        return False
+    tokens = {tok.strip().lower() for tok in connection.split(",")}
+    return "upgrade" in tokens and upgrade.strip().lower() == "websocket"
+
+
+def _plain_response(status: Any, reason: str, body: bytes) -> Any:
+    """A complete little HTTP reply. websockets serializes exactly what we hand
+    it and adds nothing, so Content-Length is ours to set."""
+    from websockets.datastructures import Headers
+    from websockets.http11 import Response
+
+    return Response(
+        status, reason,
+        Headers([
+            ("Content-Type", "text/plain; charset=utf-8"),
+            ("Content-Length", str(len(body))),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Connection", "close"),
+        ]),
+        body,
+    )
+
+
 def make_origin_gate(port: int = PORT):
-    """A ``process_request`` for websockets.serve that refuses a cross-origin
-    handshake BEFORE accept(). Returns None to let a connection through."""
+    """A ``process_request`` for websockets.serve: refuses a cross-origin
+    handshake BEFORE accept(), and answers a plain HTTP request itself. Returns
+    None only for a real, allowed handshake."""
 
     def gate(_conn: Any, request: Any) -> Any:
-        if origin_allowed(request.headers, port):
-            return None
         from http import HTTPStatus
 
-        from websockets.datastructures import Headers
-        from websockets.http11 import Response
-
-        log.warning("refused cross-origin websocket on :%d", port)
-        return Response(
-            HTTPStatus.FORBIDDEN, "Forbidden",
-            Headers([("Content-Type", "text/plain")]),
-            b"cross-origin websocket refused\n",
-        )
+        if not origin_allowed(request.headers, port):
+            log.warning("refused cross-origin websocket on :%d", port)
+            return _plain_response(
+                HTTPStatus.FORBIDDEN, "Forbidden", b"cross-origin websocket refused\n"
+            )
+        if is_websocket_upgrade(request.headers):
+            return None
+        # Not a handshake. The app's liveness probe GETs this port every 5 s;
+        # letting that fall through to accept() raises InvalidUpgrade, which
+        # websockets logs as an ERROR plus a full traceback on EVERY poll — the
+        # noise that buried the real lines in the voice log. Answer it here, the
+        # way notes/server.py answers a plain request on :8771.
+        if request.path not in ("/", "/index.html"):
+            return _plain_response(HTTPStatus.NOT_FOUND, "Not Found", b"not found\n")
+        return _plain_response(HTTPStatus.OK, "OK", b"sonar voice loop\n")
 
     return gate
 HARNESS_URL = os.environ.get("SONAR_HARNESS_URL", "http://127.0.0.1:8787").rstrip("/")
@@ -201,8 +238,8 @@ class VoiceLoop:
         self._ack_rng = random.Random()          # rotate acks; avoid back-to-back repeats
         self._last_ack: str | None = None
         self.notes: NotesController | None = None  # built in load()
-        self._notes_ws: Any | None = None          # overlay conn that started notes
         self.clients: set[Any] = set()             # every connected overlay/poker WS
+        self._consumer: asyncio.Task[None] | None = None  # THE mic drain (see _consume)
 
     async def load(self) -> None:
         print("[voice] loading parakeet STT (first run downloads ~1-2GB)…", flush=True)
@@ -233,9 +270,15 @@ class VoiceLoop:
             port=NOTES_PORT,
             on_ended=self._on_notes_done,
         )
+        # The mic drain belongs to the PROCESS, not to a connection (see
+        # _consume). _on_audio needs the loop too, and drops every frame while
+        # it is None, so bind it here rather than on first connect.
+        self.loop = asyncio.get_running_loop()
+        self._consumer = asyncio.create_task(self._consume())
         print(f"[voice] ready — harness {HARNESS_URL}", flush=True)
 
     async def aclose(self) -> None:
+        await self._cancel_consumer()
         await self._cancel_response()
         self.stop_mic()
         self.player.stop()
@@ -281,8 +324,6 @@ class VoiceLoop:
     async def handler(self, ws) -> None:
         print("[voice] overlay connected", flush=True)
         self.clients.add(ws)
-        self.loop = asyncio.get_running_loop()
-        consumer = asyncio.create_task(self._consume(ws))
         try:
             async for raw in ws:
                 try:
@@ -300,9 +341,9 @@ class VoiceLoop:
                         # transcribe it as a phantom speaker. Drop the push.
                         log.info("suppressing proactive say during a notes session")
                         continue
-                    self._start_say(ws, text.strip())
+                    self._start_say(text.strip())
                 elif isinstance(text, str) and text.strip():
-                    if self._maybe_start_notes(ws, text.strip()):
+                    if self._maybe_start_notes(text.strip()):
                         continue  # typed "take notes" starts a session, not a turn
                     if self._notes_recording():
                         # A live meeting owns the audio; a harness turn here would
@@ -310,7 +351,7 @@ class VoiceLoop:
                         # notes page when the meeting's done).
                         log.info("suppressing typed turn during a notes session")
                         continue
-                    self._start_response(ws, text.strip())  # typed -> harness + TTS
+                    self._start_response(text.strip())  # typed -> harness + TTS
                 elif cmd == "start":
                     self.listening = True
                     self.history = []  # fresh conversation each time the overlay opens
@@ -331,20 +372,57 @@ class VoiceLoop:
                     print("[voice] stopped", flush=True)
         finally:
             self.clients.discard(ws)
-            consumer.cancel()
-            self.listening = False
-            # Tearing the connection down cancels _consume — the ONLY thing
-            # draining self.frames. Leaving the mic hot now (even to protect a
-            # live notes session) just fills the queue unbounded and freezes the
-            # transcript, so ALWAYS stop it. The notes page is a separate tab
-            # that stays up, so the user can still End from there.
-            if self._notes_recording():
-                log.warning("overlay disconnected mid-notes — stopping the now-consumerless mic (End from the notes page)")
-            self.stop_mic()
-            await self._silence()  # dropped socket: don't keep talking to a gone overlay
+            # LAST CLIENT ONLY: listening, the mic and the in-flight turn are all
+            # process-wide state. A short-lived poker (scripts/morning_brief.py
+            # connects, says its piece, disconnects) sharing the port must not
+            # tear down the overlay's live session — that killed the mic and the
+            # user's answer mid-turn while the overlay still drew "listening".
+            if not self.clients:
+                self.listening = False
+                # The mic loop outlives every connection now, so leaving the mic
+                # hot for a live meeting no longer strands an undrained queue.
+                if not self._notes_active():
+                    self.stop_mic()
+                await self._silence()  # nobody left to talk to: stop talking
 
-    async def _consume(self, ws) -> None:
-        """Single mic loop: capture+STT while listening, barge-in while speaking."""
+    async def _consume(self) -> None:
+        """Supervise the mic loop for the life of the process.
+
+        It is the ONLY thing draining ``self.frames``, so one fault must not
+        leave it dead — the queue would then grow unbounded and the transcript
+        would freeze silently. Restart it instead; its capture state resets,
+        which is what you want after a fault.
+        """
+        while True:
+            try:
+                await self._mic_loop()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — the mic drain must outlive any fault
+                log.exception("mic loop crashed — restarting it")
+                await asyncio.sleep(0.05)
+
+    async def _cancel_consumer(self) -> None:
+        task, self._consumer = self._consumer, None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def _mic_loop(self) -> None:
+        """THE mic loop: capture+STT while listening, barge-in while speaking.
+
+        Exactly one of these runs per PROCESS (started in load()). It used to be
+        one task per connection, but there is a single mic queue and a single
+        stateful endpointer, and asyncio.Queue hands each frame to exactly ONE
+        getter — so two concurrent clients split the audio frame by frame:
+        SPEECH_START landed in one task and TURN_END in the other, whose
+        utterance was empty, and the spoken turn vanished without a trace.
+
+        Its display events BROADCAST: with no owning connection, the client that
+        draws the box isn't necessarily the one that started the turn (the same
+        reason _speak_text broadcasts).
+        """
         buf = bytearray()
         preroll: deque[bytes] = deque(maxlen=PREROLL_FRAMES)
         utterance: list[bytes] = []
@@ -389,11 +467,11 @@ class VoiceLoop:
                     if notes_live and not self.speaking:
                         self.notes.feed(frame, vad)
                     if ticks % 3 == 0:
-                        await self._send(ws, {"state": "listening", "level": level})
+                        await self._broadcast({"state": "listening", "level": level})
                     continue
 
                 if self.speaking:
-                    if await self._barge_check(ws, vad, level, preroll):
+                    if await self._barge_check(vad, level, preroll):
                         # barged: fall through and let the capture path see this
                         # frame as the start of the new utterance.
                         capturing = False
@@ -404,7 +482,7 @@ class VoiceLoop:
                         continue
 
                 if ticks % 3 == 0:
-                    await self._send(ws, {
+                    await self._broadcast({
                         "state": "thinking" if capturing else "listening",
                         "level": level,
                     })
@@ -413,7 +491,7 @@ class VoiceLoop:
                     since_partial += 1
                     if since_partial >= PARTIAL_FRAMES:
                         since_partial = 0
-                        await self._emit_transcript(ws, utterance, final=False)
+                        await self._emit_transcript(utterance, final=False)
                 else:
                     preroll.append(frame)
 
@@ -425,12 +503,12 @@ class VoiceLoop:
                 elif ev == VadEvent.TURN_END:
                     capturing = False
                     turn, utterance = utterance, []
-                    text = await self._emit_transcript(ws, turn, final=True)
-                    if text.strip() and not self._maybe_start_notes(ws, text.strip()):
-                        self._start_response(ws, text.strip())
+                    text = await self._emit_transcript(turn, final=True)
+                    if text.strip() and not self._maybe_start_notes(text.strip()):
+                        self._start_response(text.strip())
 
     async def _barge_check(
-        self, ws, vad: float, level: float, preroll: deque[bytes]
+        self, vad: float, level: float, preroll: deque[bytes]
     ) -> bool:
         """While speaking, decide duck/barge-in. Return True iff we barged in.
 
@@ -440,7 +518,7 @@ class VoiceLoop:
         """
         decision = self.gate.observe(vad, level, self.player.last_rms())
         if decision.barge_in:
-            await self._barge_in(ws)
+            await self._barge_in()
             return True
         if decision.duck:
             if self.player.gain > DUCK_GAIN:
@@ -449,15 +527,15 @@ class VoiceLoop:
             self.player.set_gain(1.0)  # suspicion passed — un-duck
         return False
 
-    async def _barge_in(self, ws) -> None:
+    async def _barge_in(self) -> None:
         """User talked over the reply: kill reply+audio, reset, resume listening."""
         print("[voice] barge-in", flush=True)
         await self._silence()
         self.endpointer.reset()
         if self.silero is not None:
             self.silero.reset_states()
-        await self._send(ws, {"answer": "", "partial": False})
-        await self._send(ws, {"state": "listening", "level": 0.2})
+        await self._broadcast({"answer": "", "partial": False})
+        await self._broadcast({"state": "listening", "level": 0.2})
 
     # ---- notes mode (diarized note taker; see notes/) ----
     def _notes_recording(self) -> bool:
@@ -473,23 +551,22 @@ class VoiceLoop:
         """
         return self.notes is not None and self.notes.active
 
-    def _maybe_start_notes(self, ws, text: str) -> bool:
+    def _maybe_start_notes(self, text: str) -> bool:
         """Start a notes session iff ``text`` is the 'take notes' command."""
         if self.notes is None or self._notes_recording() or not wants_notes_start(text):
             return False
         if self._response_task is not None and not self._response_task.done():
             self._response_task.cancel()
-        self._response_task = asyncio.create_task(self._start_notes(ws, text))
+        self._response_task = asyncio.create_task(self._start_notes(text))
         return True
 
-    async def _start_notes(self, ws, trigger_text: str) -> None:
+    async def _start_notes(self, trigger_text: str) -> None:
         """Bring up the notes UI, say so, then open the mic tap.
 
         Ordering matters: capture begins only AFTER the spoken ack has fully
         played, so Sonar's own voice can never leak into the transcript as a
         phantom speaker.
         """
-        self._notes_ws = ws
         try:
             url = await self.notes.start(title_hint=notes_title_hint(trigger_text))
             print(f"[voice] notes session — UI at {url}", flush=True)
@@ -497,7 +574,7 @@ class VoiceLoop:
             # (STT rarely hears "stop taking notes" cleanly), so the notes window's
             # End button is the real control. Just point them there.
             await self._speak_text(
-                ws, "Taking notes. Hit end in the notes window when you're done."
+                "Taking notes. Hit end in the notes window when you're done."
             )
             self.start_mic()  # normally already hot; harmless if so
             self.notes.begin_capture()
@@ -510,7 +587,7 @@ class VoiceLoop:
             log.exception("notes session failed to start")
             with contextlib.suppress(Exception):
                 await self.notes.discard()
-            await self._speak_text(ws, f"Sorry, I couldn't open the notes window. {exc}")
+            await self._speak_text(f"Sorry, I couldn't open the notes window. {exc}")
 
     async def _on_notes_done(self) -> None:
         """Notes session left recording (ended or discarded): hand the mic back.
@@ -533,17 +610,17 @@ class VoiceLoop:
             self.silero.reset_states()
 
     # ---- response: harness turn -> box + TTS ----
-    def _start_response(self, ws, text: str) -> None:
+    def _start_response(self, text: str) -> None:
         """(Re)start the response task for ``text``; a new turn replaces any old."""
         if self._response_task is not None and not self._response_task.done():
             self._response_task.cancel()
-        self._response_task = asyncio.create_task(self._respond(ws, text))
+        self._response_task = asyncio.create_task(self._respond(text))
 
-    def _start_say(self, ws, text: str) -> None:
+    def _start_say(self, text: str) -> None:
         """Start a proactive spoken message, replacing any in-flight turn."""
         if self._response_task is not None and not self._response_task.done():
             self._response_task.cancel()
-        self._response_task = asyncio.create_task(self._speak_text(ws, text))
+        self._response_task = asyncio.create_task(self._speak_text(text))
 
     async def _cancel_response(self) -> None:
         task = self._response_task
@@ -568,19 +645,24 @@ class VoiceLoop:
         self.gate.reset()
         self.speaking = False
 
-    async def _respond(self, ws, text: str) -> None:
-        """Drive one turn: spoken ack -> streamed harness answer -> box + speaker."""
+    async def _respond(self, text: str) -> None:
+        """Drive one turn: spoken ack -> streamed harness answer -> box + speaker.
+
+        Everything it shows BROADCASTS, for the same reason _speak_text does: the
+        turn can be started by the mic loop (which owns no connection) or by a
+        poker that isn't the client drawing the box.
+        """
         self.speaking = True
         self.gate.reset()
         self.player.set_gain(1.0)
-        await self._send(ws, {"turn": "start"})
-        await self._send(ws, {"state": "thinking", "level": 0.6})
+        await self._broadcast({"turn": "start"})
+        await self._broadcast({"state": "thinking", "level": 0.6})
         # Prior turns ride along so follow-ups resolve against the session; the
         # completed turn is committed to history only on the clean path below (a
         # barged/cancelled turn is never remembered).
         messages = self.history + [{"role": "user", "content": text}]
         delta_q: asyncio.Queue[str | None] = asyncio.Queue()
-        pump = asyncio.create_task(self._pump(ws, messages, delta_q))
+        pump = asyncio.create_task(self._pump(messages, delta_q))
         try:
             # Rotate the ack so it isn't "One sec." every turn (env forces a fixed one).
             ack = ACK_TEXT or next_ack(self._last_ack, self._ack_rng)
@@ -597,22 +679,23 @@ class VoiceLoop:
                 await pump
             raise
         finally:
-            await self._send(ws, {"answer": "", "partial": False})
-            await self._send(ws, {"turn": "end"})
-            await self._send(ws, {"state": "listening", "level": 0.2})
+            await self._broadcast({"answer": "", "partial": False})
+            await self._broadcast({"turn": "end"})
+            await self._broadcast({"state": "listening", "level": 0.2})
             self.speaking = False
 
-    async def _speak_text(self, ws, text: str) -> None:
+    async def _speak_text(self, text: str) -> None:
         """Speak already-composed text with NO harness turn (a proactive push, e.g.
         the scheduled morning brief). Summons the overlay box to show the full text
         and streams it to Kokoro clause by clause. Cancellable like a normal turn,
         so an F5 cutoff (``_silence``) silences it too.
 
-        The display events BROADCAST to every connected client, not just ``ws``: a
-        proactive push arrives on its own short-lived connection (morning_brief.py),
-        so the glow that actually draws the box is a DIFFERENT client — sending only
-        to the poker left the box empty (the v1 caveat this fixes). The ``summon``
-        flag tells the glow to reveal its (normally hidden) box and show ``text``.
+        The display events BROADCAST to every connected client, never to just the
+        sender: a proactive push arrives on its own short-lived connection
+        (morning_brief.py), so the glow that actually draws the box is a DIFFERENT
+        client — sending only to the poker left the box empty (the v1 caveat this
+        fixes). The ``summon`` flag tells the glow to reveal its (normally hidden)
+        box and show ``text``.
         """
         self.speaking = True
         self.gate.reset()
@@ -634,7 +717,7 @@ class VoiceLoop:
         yield text
 
     async def _pump(
-        self, ws, messages: list[dict[str, str]], delta_q: asyncio.Queue[str | None]
+        self, messages: list[dict[str, str]], delta_q: asyncio.Queue[str | None]
     ) -> str:
         """Stream the harness turn: steps -> box, answer deltas -> box + delta_q.
 
@@ -645,14 +728,14 @@ class VoiceLoop:
         try:
             async for kind, val in stream_turn(self.harness, messages):
                 if kind == STEP:
-                    await self._send(ws, {"step": val})
+                    await self._broadcast({"step": val})
                 elif kind == DELTA:
                     parts.append(val)
-                    await self._send(ws, {"answer": val, "partial": True})
+                    await self._broadcast({"answer": val, "partial": True})
                     await delta_q.put(val)
         except Exception as exc:  # noqa: BLE001 — surface harness failure, keep loop alive
             log.exception("harness turn failed")
-            await self._send(ws, {"answer": f"[harness error: {exc}]", "partial": True})
+            await self._broadcast({"answer": f"[harness error: {exc}]", "partial": True})
         finally:
             await delta_q.put(None)  # sentinel: end of stream
         return "".join(parts)
@@ -691,12 +774,12 @@ class VoiceLoop:
             await asyncio.sleep(0.05)
 
     # ---- STT emit ----
-    async def _emit_transcript(self, ws, chunks: list[bytes], final: bool) -> str:
+    async def _emit_transcript(self, chunks: list[bytes], final: bool) -> str:
         """Transcribe the audio-so-far, push it to the box, return the text.
 
         Feeds the WHOLE buffer to Parakeet as ONE chunk: a sub-window sliver
         underflows to a 2^64-4096 Metal alloc, and one-shot on the full buffer is
-        the model's own warmup path (see stt_bridge.py for the root-cause note).
+        the model's own warmup path.
         """
         if not chunks:
             return ""
@@ -705,7 +788,7 @@ class VoiceLoop:
             return ""
         text = await self._transcribe_pcm(pcm)
         if text.strip():
-            await self._send(ws, {"transcript": text, "partial": not final})
+            await self._broadcast({"transcript": text, "partial": not final})
         return text
 
     async def _stt_text(self, pcm: bytes) -> str:
@@ -713,8 +796,8 @@ class VoiceLoop:
 
         Feeds the WHOLE buffer as ONE chunk (a sub-window sliver underflows to a
         2^64-4096 Metal alloc; one-shot on the full buffer is the model's own
-        warmup path — see stt_bridge.py). Callers pick their own failure policy:
-        the assistant path drops a bad utterance; the notes path toasts it.
+        warmup path). Callers pick their own failure policy: the assistant path
+        drops a bad utterance; the notes path toasts it.
         """
         async def audio() -> AsyncIterator[bytes]:
             yield pcm
@@ -741,9 +824,11 @@ class VoiceLoop:
     async def _broadcast(self, msg: dict) -> None:
         """Fan a box-display event out to every connected client.
 
-        Used by proactive pushes (the morning brief): they arrive on their own
-        connection, so the glow that draws the box is a different client. Iterate a
-        snapshot — a slow/dropped socket must not abort delivery to the others."""
+        How every turn event ships: the mic loop owns no connection, and a
+        proactive push arrives on its own (morning_brief.py), so the glow that
+        draws the box is routinely a different client than the one that started
+        the turn. Iterate a snapshot — a slow/dropped socket must not abort
+        delivery to the others."""
         payload = json.dumps(msg)
         for ws in list(self.clients):
             with contextlib.suppress(Exception):
@@ -757,13 +842,22 @@ async def main() -> None:
     loop = VoiceLoop()
     await loop.load()
 
+    stop = asyncio.Event()
+    running = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        # Without a handler the default SIGTERM disposition kills the process
+        # outright and the finally below never runs — so a `daemon install` or a
+        # logout tore the loop down with the mic, the notes server and the
+        # harness client all left mid-flight. Same shape as notes/__main__.py.
+        with contextlib.suppress(NotImplementedError):
+            running.add_signal_handler(sig, stop.set)
     try:
         async with websockets.serve(
             loop.handler, HOST, PORT,
             origins=serve_origins(), process_request=make_origin_gate(PORT),
         ):
             print(f"[voice] serving ws://{HOST}:{PORT}; Ctrl-C to stop", flush=True)
-            await asyncio.Future()
+            await stop.wait()
     finally:
         await loop.aclose()
 

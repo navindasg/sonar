@@ -16,13 +16,16 @@ that door needs a shared token, which is a separate change.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 
+import httpx
 import pytest
 import websockets
 
 from voice_loop import (
     allowed_origins,
+    is_websocket_upgrade,
     make_origin_gate,
     origin_allowed,
     serve_origins,
@@ -30,14 +33,28 @@ from voice_loop import (
 
 
 class _Headers:
-    """Mimics the websockets Headers.get contract, including its raising
-    behaviour on a duplicated header."""
+    """Mimics the websockets Headers.get contract — per-NAME lookups, and its
+    raising behaviour on a duplicated header. Defaults describe a real
+    handshake, so an Origin-only test reads as one."""
 
-    def __init__(self, value: str | None = None, *, duplicated: bool = False) -> None:
+    def __init__(
+        self,
+        value: str | None = None,
+        *,
+        duplicated: bool = False,
+        upgrade: str | None = "websocket",
+        connection: str | None = "Upgrade",
+    ) -> None:
         self._value = value
         self._duplicated = duplicated
+        self._upgrade = upgrade
+        self._connection = connection
 
-    def get(self, _name: str) -> str | None:
+    def get(self, name: str) -> str | None:
+        if name == "Upgrade":
+            return self._upgrade
+        if name == "Connection":
+            return self._connection
         if self._duplicated:
             raise ValueError("duplicate Origin header")
         return self._value
@@ -104,8 +121,42 @@ def test_gate_returns_403_for_a_hostile_page() -> None:
 
 
 class _Request:
-    def __init__(self, headers: _Headers) -> None:
+    def __init__(self, headers: _Headers, path: str = "/") -> None:
         self.headers = headers
+        self.path = path
+
+
+# ---- plain HTTP must NOT fall through to accept() ----------------------------
+# The app's ServiceProbe GETs this port every 5 s with `Connection: keep-alive`
+# and no Upgrade. Falling through to accept() raises InvalidUpgrade, which
+# websockets logs as an ERROR plus a ~10-line traceback on EVERY poll — ~17k a
+# day, which is what buried the real lines the night the loop died overnight
+# and a notes session lost its transcript.
+def test_upgrade_detection_needs_both_headers() -> None:
+    assert is_websocket_upgrade(_Headers(connection="Upgrade", upgrade="websocket"))
+    assert is_websocket_upgrade(_Headers(connection="keep-alive, Upgrade",
+                                         upgrade="WebSocket"))
+    assert not is_websocket_upgrade(_Headers(connection="keep-alive", upgrade=None))
+    # Upgrade without the Connection token is what accept() rejects FIRST.
+    assert not is_websocket_upgrade(_Headers(connection="keep-alive",
+                                             upgrade="websocket"))
+    assert not is_websocket_upgrade(_Headers(connection="Upgrade", upgrade="h2c"))
+
+
+def test_gate_answers_a_plain_probe_instead_of_falling_through() -> None:
+    gate = make_origin_gate(8770)
+    probe = _Request(_Headers(None, connection="keep-alive", upgrade=None))
+    resp = gate(None, probe)
+    assert resp is not None, "a plain GET must be answered here, not by accept()"
+    assert resp.status_code == 200
+    assert resp.headers["Content-Length"] == str(len(resp.body))
+
+
+def test_gate_404s_an_unknown_path() -> None:
+    gate = make_origin_gate(8770)
+    resp = gate(None, _Request(_Headers(None, connection="keep-alive", upgrade=None),
+                               path="/admin"))
+    assert resp.status_code == 404
 
 
 # ---- real handshake, real server --------------------------------------------
@@ -136,6 +187,31 @@ async def test_a_no_origin_client_really_connects() -> None:
         await server.wait_closed()
 
     assert seen == ['{"cmd":"start"}']
+
+
+async def test_a_liveness_probe_gets_200_and_logs_no_traceback(caplog) -> None:
+    """The regression that made the voice log ~90% noise: a plain GET fell
+    through to accept(), which raised InvalidUpgrade and logged ERROR + a full
+    traceback every 5 seconds. :8771 has always behaved; :8770 must too."""
+
+    async def handler(ws):  # pragma: no cover — a probe never reaches the handler
+        raise AssertionError("a plain HTTP GET reached the WS handler")
+
+    server = await _serve(handler)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        with caplog.at_level(logging.ERROR, logger="websockets.server"):
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"http://127.0.0.1:{port}/")
+        assert resp.status_code == 200
+        assert resp.text.strip()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert caplog.records == [], (
+        f"the probe still logs errors: {[r.getMessage() for r in caplog.records]}"
+    )
 
 
 async def test_a_hostile_origin_is_really_refused() -> None:
