@@ -18,10 +18,12 @@ a shared token, which is a separate change.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import sys
 
+import httpx
 import pytest
 import websockets
 
@@ -37,6 +39,7 @@ sys.path.insert(0, _OVERLAY)
 import bridge  # noqa: E402
 from bridge import (  # noqa: E402
     allowed_origins,
+    is_websocket_upgrade,
     make_origin_gate,
     origin_allowed,
     serve_origins,
@@ -44,22 +47,37 @@ from bridge import (  # noqa: E402
 
 
 class _Headers:
-    """Mimics the websockets Headers.get contract, including its raising
-    behaviour on a duplicated header."""
+    """Mimics the websockets Headers.get contract — per-NAME lookups, and its
+    raising behaviour on a duplicated header. Defaults describe a real
+    handshake, so an Origin-only test reads as one."""
 
-    def __init__(self, value: str | None = None, *, duplicated: bool = False) -> None:
+    def __init__(
+        self,
+        value: str | None = None,
+        *,
+        duplicated: bool = False,
+        upgrade: str | None = "websocket",
+        connection: str | None = "Upgrade",
+    ) -> None:
         self._value = value
         self._duplicated = duplicated
+        self._upgrade = upgrade
+        self._connection = connection
 
-    def get(self, _name: str) -> str | None:
+    def get(self, name: str) -> str | None:
+        if name == "Upgrade":
+            return self._upgrade
+        if name == "Connection":
+            return self._connection
         if self._duplicated:
             raise ValueError("duplicate Origin header")
         return self._value
 
 
 class _Request:
-    def __init__(self, headers: _Headers) -> None:
+    def __init__(self, headers: _Headers, path: str = "/") -> None:
         self.headers = headers
+        self.path = path
 
 
 def test_our_own_page_origins_are_allowed() -> None:
@@ -121,6 +139,52 @@ def test_gate_returns_403_for_a_hostile_page() -> None:
     assert resp.status_code == 403
 
 
+# ---- plain HTTP must NOT fall through to accept() ----------------------------
+# `sonar.sh up` runs the bridge on :8770 whenever voice isn't up, and the app
+# probes the port every 5 s regardless of who owns it. Without this branch the
+# probe reaches accept(), raises InvalidUpgrade and logs ERROR + a full
+# traceback each time — the same flood as the voice loop, in the bridge log.
+def test_upgrade_detection_needs_both_headers() -> None:
+    assert is_websocket_upgrade(_Headers(connection="Upgrade", upgrade="websocket"))
+    assert is_websocket_upgrade(_Headers(connection="keep-alive, Upgrade",
+                                         upgrade="WebSocket"))
+    assert not is_websocket_upgrade(_Headers(connection="keep-alive", upgrade=None))
+    assert not is_websocket_upgrade(_Headers(connection="keep-alive",
+                                             upgrade="websocket"))
+    assert not is_websocket_upgrade(_Headers(connection="Upgrade", upgrade="h2c"))
+
+
+def test_gate_answers_a_plain_probe_instead_of_falling_through() -> None:
+    resp = make_origin_gate(8770)(
+        None, _Request(_Headers(None, connection="keep-alive", upgrade=None))
+    )
+    assert resp is not None, "a plain GET must be answered here, not by accept()"
+    assert resp.status_code == 200
+    assert resp.headers["Content-Length"] == str(len(resp.body))
+
+
+def test_gate_404s_an_unknown_path() -> None:
+    resp = make_origin_gate(8770)(
+        None,
+        _Request(_Headers(None, connection="keep-alive", upgrade=None), path="/admin"),
+    )
+    assert resp.status_code == 404
+
+
+def test_both_8770_gates_agree_on_a_plain_probe() -> None:
+    """bridge.py and voice_loop.py each bind :8770 and each carry their own copy
+    of this gate (two self-contained PEP 723 scripts — neither can import the
+    other). Fixing one and not the other is exactly how the noise comes back."""
+    import voice_loop
+
+    probe = _Request(_Headers(None, connection="keep-alive", upgrade=None))
+    hostile = _Request(_Headers("http://evil.com"))
+    for gate in (make_origin_gate(8770), voice_loop.make_origin_gate(8770)):
+        assert gate(None, probe).status_code == 200
+        assert gate(None, hostile).status_code == 403
+        assert gate(None, _Request(_Headers(None))) is None   # the F5 handshake
+
+
 # ---- real handshake, real server --------------------------------------------
 # Written as sync tests driving asyncio.run() on purpose: overlay/ has no pytest
 # config of its own, so there is no asyncio_mode=auto to lean on the way
@@ -154,6 +218,33 @@ def test_a_no_origin_client_really_connects() -> None:
 
     asyncio.run(scenario())
     assert seen == ['{"cmd":"start"}']
+
+
+def test_a_liveness_probe_gets_200_and_logs_no_traceback(caplog) -> None:
+    """The app's 5 s probe must be answered, not tracebacked — same regression
+    guard as the voice loop's, on the process that owns :8770 without voice."""
+
+    async def scenario() -> None:
+        async def handler(ws):  # pragma: no cover — a probe never reaches it
+            raise AssertionError("a plain HTTP GET reached the WS handler")
+
+        server = await _serve(handler)
+        try:
+            port = server.sockets[0].getsockname()[1]
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"http://127.0.0.1:{port}/")
+            assert resp.status_code == 200
+            assert resp.text.strip()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    with caplog.at_level(logging.ERROR, logger="websockets.server"):
+        asyncio.run(scenario())
+
+    assert caplog.records == [], (
+        f"the probe still logs errors: {[r.getMessage() for r in caplog.records]}"
+    )
 
 
 def test_a_hostile_origin_is_really_refused() -> None:

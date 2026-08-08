@@ -90,24 +90,61 @@ def origin_allowed(headers: Any, port: int = PORT) -> bool:
     return origin in allowed_origins(port)
 
 
+def is_websocket_upgrade(headers: Any) -> bool:
+    """True only for a real handshake: Connection carries an ``upgrade`` token
+    AND Upgrade is ``websocket``. Those are the two things accept() checks (in
+    that order) before it raises; anything else is a plain HTTP request."""
+    try:
+        connection = headers.get("Connection") or ""
+        upgrade = headers.get("Upgrade") or ""
+    except Exception:  # noqa: BLE001 — malformed/duplicate headers: not a handshake
+        return False
+    tokens = {tok.strip().lower() for tok in connection.split(",")}
+    return "upgrade" in tokens and upgrade.strip().lower() == "websocket"
+
+
+def _plain_response(status: Any, reason: str, body: bytes) -> Any:
+    """A complete little HTTP reply. websockets serializes exactly what we hand
+    it and adds nothing, so Content-Length is ours to set."""
+    from websockets.datastructures import Headers
+    from websockets.http11 import Response
+
+    return Response(
+        status, reason,
+        Headers([
+            ("Content-Type", "text/plain; charset=utf-8"),
+            ("Content-Length", str(len(body))),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Connection", "close"),
+        ]),
+        body,
+    )
+
+
 def make_origin_gate(port: int = PORT):
-    """A ``process_request`` for websockets.serve that refuses a cross-origin
-    handshake BEFORE accept(). Returns None to let a connection through."""
+    """A ``process_request`` for websockets.serve: refuses a cross-origin
+    handshake BEFORE accept(), and answers a plain HTTP request itself. Returns
+    None only for a real, allowed handshake. Deliberately a twin of
+    voice_loop.py's gate — both bind :8770, and each is a self-contained PEP 723
+    script that cannot import from the other (test_bridge_origin pins that the
+    two behave identically)."""
 
     def gate(_conn: Any, request: Any) -> Any:
-        if origin_allowed(request.headers, port):
-            return None
         from http import HTTPStatus
 
-        from websockets.datastructures import Headers
-        from websockets.http11 import Response
-
-        log.warning("refused cross-origin websocket on :%d", port)
-        return Response(
-            HTTPStatus.FORBIDDEN, "Forbidden",
-            Headers([("Content-Type", "text/plain")]),
-            b"cross-origin websocket refused\n",
-        )
+        if not origin_allowed(request.headers, port):
+            log.warning("refused cross-origin websocket on :%d", port)
+            return _plain_response(
+                HTTPStatus.FORBIDDEN, "Forbidden", b"cross-origin websocket refused\n"
+            )
+        if is_websocket_upgrade(request.headers):
+            return None
+        # Not a handshake. The app's liveness probe GETs this port every 5 s;
+        # letting that fall through to accept() raises InvalidUpgrade, which
+        # websockets logs as an ERROR plus a full traceback on EVERY poll.
+        if request.path not in ("/", "/index.html"):
+            return _plain_response(HTTPStatus.NOT_FOUND, "Not Found", b"not found\n")
+        return _plain_response(HTTPStatus.OK, "OK", b"sonar overlay bridge\n")
 
     return gate
 
