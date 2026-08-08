@@ -11,7 +11,8 @@ Lifecycle: `start()` prepares everything (server, browser tab, embedder) with
 feeding OFF so the voice loop can speak its ack without the mic hearing it into
 the transcript; `begin_capture()` then opens the tap. `end()` — from the UI
 End button or a spoken stop-phrase — drains in-flight utterances, gets the AI
-overview, and hands the session to the UI for review/save.
+overview, auto-saves a draft into the vault (so a crash before anyone clicks
+Save can't lose the meeting), and hands the session to the UI for review/save.
 """
 from __future__ import annotations
 
@@ -92,6 +93,7 @@ class NotesController:
         self._ending = False
         self._on_ended_fired = False
         self._save_path: Path | None = None
+        self._draft_path: Path | None = None   # auto-saved at end(), not yet confirmed
         self._registry = SpeakerRegistry(threshold=self._threshold)
         self._endpointer = Endpointer(silence_ms=self._silence_ms)
         self._preroll: deque[bytes] = deque(maxlen=_PREROLL_FRAMES)
@@ -133,6 +135,7 @@ class NotesController:
         title = title_hint or f"Notes {now.strftime('%Y-%m-%d %H-%M')}"
         self.state = sess.SessionState(title=title, started_at=now.isoformat(timespec="seconds"))
         self._save_path = None
+        self._draft_path = None
         self._feeding = False
         self._ending = False
         self._on_ended_fired = False
@@ -364,7 +367,40 @@ class NotesController:
         self.state = sess.set_status(sess.set_summary(self.state, summary), sess.REVIEW)
         self._ending = False
         await self._broadcast_state()
+        await self._autosave_draft()
         await self._fire_on_ended()
+
+    async def _autosave_draft(self) -> None:
+        """Put the finished session in the vault BEFORE anyone clicks Save.
+
+        Save lives only in the browser page, so until it is pressed a finished
+        meeting exists solely in this process's memory: a crash, a logout, or a
+        redeploy SIGTERMing the voice loop takes the transcript AND the overview
+        with it, unrecoverably (2026-08-07 — a session reached REVIEW with a
+        generated overview and nothing was ever written to the vault).
+
+        The status stays REVIEW: the user hasn't confirmed anything, so Discard
+        is still offered and no "Saved to …" toast fires. Only ``_save_path`` is
+        pinned, so a later manual Save re-renders the SAME file rather than
+        creating a second one, and Discard deletes what we wrote.
+
+        Best-effort by construction: end() is driven from a bare create_task, so
+        an exception escaping here would skip _fire_on_ended and strand the mic.
+        """
+        if self.state is None:
+            return
+        try:
+            self._draft_path = await asyncio.to_thread(
+                store.save_note, self.state, self._vault, datetime.now(), self._save_path
+            )
+        except Exception as exc:  # noqa: BLE001 — a failed autosave must not break end()
+            log.error("auto-saving the notes draft failed: %s", exc)
+            await self.server.broadcast(
+                {"type": "error", "message": f"auto-save failed: {exc}"}
+            )
+            return
+        self._save_path = self._draft_path
+        log.info("notes draft auto-saved to %s", self._draft_path)
 
     async def _fire_on_ended(self) -> None:
         """Hand the mic back to the voice loop — at most once per session exit."""
@@ -392,9 +428,25 @@ class NotesController:
             await self.server.broadcast({"type": "error", "message": f"save failed: {exc}"})
             return
         self._save_path = target
+        self._draft_path = None   # the user owns this file now; Discard won't remove it
         rel = target.relative_to(self._vault).as_posix()
         self.state = sess.mark_saved(self.state, rel)
         await self._broadcast_state()
+
+    def _remove_draft(self) -> None:
+        """Undo the end()-time autosave when the user discards instead.
+
+        The Discard confirm promises "the transcript will be lost", so the note
+        we wrote on their behalf has to go with it. Only ever removes a path
+        Sonar wrote itself — a manual Save clears it (see save()).
+        """
+        draft, self._draft_path = self._draft_path, None
+        if draft is None:
+            return
+        with contextlib.suppress(OSError):
+            draft.unlink()
+        if self._save_path == draft:
+            self._save_path = None
 
     async def discard(self) -> None:
         if self.state is None or self.state.status == sess.DISCARDED:
@@ -407,6 +459,7 @@ class NotesController:
         self._feeding = False
         self._cancel_partial()
         self.state = sess.set_status(self.state, sess.DISCARDED)
+        self._remove_draft()
         await self._broadcast_state()
         if was_active:
             await self._fire_on_ended()
