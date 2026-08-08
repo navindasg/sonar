@@ -1,21 +1,25 @@
 import Foundation
 
-/// Liveness of the two localhost services the popover reports beyond the harness
-/// (which the HealthPoller already covers): the voice/bridge WS server and the
-/// Notes HTTP server. "Up" just means the port answered — for the WS server a
-/// plain GET returns an HTTP error status, which still proves it is listening.
+/// Liveness of the two localhost ports the popover reports beyond the harness
+/// (which the HealthPoller already covers): the overlay bridge socket and the
+/// Notes HTTP server. "Up" means only that the port answered.
+///
+/// `bridgeUp` deliberately does NOT mean "the voice loop is running": :8770 has
+/// two mutually exclusive owners (overlay/bridge.py, or the voice loop serving
+/// the same socket instead of it) and their responses are indistinguishable, so
+/// the reading is about the port, not about who holds it.
 struct ServiceStatus {
-    let voiceUp: Bool
+    let bridgeUp: Bool
     let notesUp: Bool
 
-    static let down = ServiceStatus(voiceUp: false, notesUp: false)
+    static let down = ServiceStatus(bridgeUp: false, notesUp: false)
 }
 
-/// Polls the voice + notes ports on a timer with URLSession and publishes a
+/// Polls the bridge + notes ports on a timer with URLSession and publishes a
 /// combined reading on the main thread. Kept separate from HealthPoller so the
 /// harness `/health` decode stays focused; both feed the status popover.
 final class ServiceProbe {
-    private let voiceURL: URL
+    private let bridgeURL: URL
     private let notesURL: URL
     private let interval: TimeInterval
     private let session: URLSession
@@ -24,8 +28,8 @@ final class ServiceProbe {
     /// Delivered on the main thread on every poll.
     var onUpdate: ((ServiceStatus) -> Void)?
 
-    init(voiceURL: URL, notesURL: URL, interval: TimeInterval = 5.0) {
-        self.voiceURL = voiceURL
+    init(bridgeURL: URL, notesURL: URL, interval: TimeInterval = 5.0) {
+        self.bridgeURL = bridgeURL
         self.notesURL = notesURL
         self.interval = interval
         let cfg = URLSessionConfiguration.ephemeral
@@ -59,21 +63,22 @@ final class ServiceProbe {
         // Fan out both probes, join, publish once. The group is completed on a
         // background queue, then the callback hops to main.
         let group = DispatchGroup()
-        var voiceUp = false
+        var bridgeUp = false
         var notesUp = false
 
-        probe(voiceURL, group: group) { voiceUp = $0 }
+        probe(bridgeURL, group: group) { bridgeUp = $0 }
         probe(notesURL, group: group) { notesUp = $0 }
 
         let publish = onUpdate
         group.notify(queue: .main) {
-            publish?(ServiceStatus(voiceUp: voiceUp, notesUp: notesUp))
+            publish?(ServiceStatus(bridgeUp: bridgeUp, notesUp: notesUp))
         }
     }
 
-    /// A port is "up" if it produced any HTTP response (even a 4xx/426 from a WS
-    /// server); a refused/timed-out connection yields no response → down. The
-    /// completion is called exactly once per request, inside the group.
+    /// A port is "up" if it produced any HTTP response (including the non-200 a
+    /// WS server answers a plain GET with); a refused/timed-out connection yields
+    /// no response → down. The completion is called exactly once per request,
+    /// inside the group.
     private func probe(_ url: URL, group: DispatchGroup, completion: @escaping (Bool) -> Void) {
         group.enter()
         var request = URLRequest(url: url)

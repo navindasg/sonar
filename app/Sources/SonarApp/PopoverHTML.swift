@@ -140,9 +140,9 @@ svg{ fill:none; stroke:currentColor; stroke-width:1.25; stroke-linecap:round; st
         <span class="meta" id="mHarness">…</span>
       </div>
       <div class="svc">
-        <span class="dot" id="dVoice"></span>
-        <span class="name">Voice loop</span><span class="port">ws:8770</span>
-        <span class="meta" id="mVoice">…</span>
+        <span class="dot" id="dBridge"></span>
+        <span class="name">Overlay bridge</span><span class="port">ws:8770</span>
+        <span class="meta" id="mBridge">…</span>
       </div>
       <div class="svc">
         <span class="dot" id="dNotes"></span>
@@ -201,7 +201,7 @@ svg{ fill:none; stroke:currentColor; stroke-width:1.25; stroke-linecap:round; st
       else{ d.classList.add('down'); m.textContent='Down'; m.classList.add('r'); }
     }
     svc('dHarness','mHarness', s.harnessUp, 'OK');
-    svc('dVoice','mVoice', s.voiceUp, 'Up');
+    svc('dBridge','mBridge', s.bridgeUp, 'Up');
     svc('dNotes','mNotes', s.notesUp, 'Up');
 
     var doc=document.getElementById('doctor'), dt=document.getElementById('doctorText');

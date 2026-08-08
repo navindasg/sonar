@@ -17,7 +17,7 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
 /// services. Immutable snapshot recomputed and pushed on every reading.
 private struct PopoverPayload: Encodable {
     let harnessUp: Bool
-    let voiceUp: Bool
+    let bridgeUp: Bool
     let notesUp: Bool
     let model: String
     let tools: Int
@@ -36,6 +36,11 @@ final class StatusItemController: NSObject, NSPopoverDelegate, WKScriptMessageHa
 
     /// Invoked on the main thread when Open Notes is chosen.
     var onOpenNotes: (() -> Void)?
+
+    /// Invoked on the main thread when the popover appears (true) / closes
+    /// (false). The popover's WebView is the only consumer of the live readings,
+    /// so the owner uses this to run the pollers exactly while they're visible.
+    var onPopoverVisibilityChanged: ((Bool) -> Void)?
 
     // Latest readings; either can arrive first, so we keep both and push the
     // merged payload whenever one updates (and once the page is ready).
@@ -102,7 +107,7 @@ final class StatusItemController: NSObject, NSPopoverDelegate, WKScriptMessageHa
         pushPayload()
     }
 
-    /// Push a fresh voice/notes liveness reading.
+    /// Push a fresh bridge/notes liveness reading.
     func setServices(_ status: ServiceStatus) {
         services = status
         pushPayload()
@@ -112,7 +117,7 @@ final class StatusItemController: NSObject, NSPopoverDelegate, WKScriptMessageHa
         guard pageReady else { return }
         let payload = PopoverPayload(
             harnessUp: health.up,
-            voiceUp: services.voiceUp,
+            bridgeUp: services.bridgeUp,
             notesUp: services.notesUp,
             model: health.model ?? "?",
             tools: health.toolCount,
@@ -122,6 +127,16 @@ final class StatusItemController: NSObject, NSPopoverDelegate, WKScriptMessageHa
               let json = String(data: data, encoding: .utf8) else { return }
         webView.evaluateJavaScript("window.sonarPopover && window.sonarPopover.apply(\(json))",
                                    completionHandler: nil)
+    }
+
+    // MARK: NSPopoverDelegate
+
+    func popoverWillShow(_ notification: Notification) {
+        onPopoverVisibilityChanged?(true)
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        onPopoverVisibilityChanged?(false)
     }
 
     // MARK: WKNavigationDelegate
