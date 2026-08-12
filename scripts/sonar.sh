@@ -305,11 +305,14 @@ cmd_voice() {
     launchctl unload "$bagent" 2>/dev/null || true
   fi
   # Hand the port to the voice loop (kill any lingering typed bridge process).
+  # LISTEN-scoped: the unscoped form also matched Hammerspoon, which is a CLIENT
+  # of :$GLOW_PORT, so taking the port over killed the overlay we are about to
+  # reconnect.
   if _port_up "$GLOW_PORT"; then
     echo "freeing :${GLOW_PORT} (stopping typed bridge for the voice loop) ..."
-    lsof -ti "tcp:$GLOW_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
+    _kill_pids "bridge" $(_port_pids "$GLOW_PORT")
     rm -f "$RUN_DIR/bridge.pid"
-    _wait_for ":${GLOW_PORT} free" bash -c "! lsof -ti tcp:${GLOW_PORT} >/dev/null 2>&1" || true
+    _wait_for ":${GLOW_PORT} free" bash -c "! lsof -ti tcp:${GLOW_PORT} -sTCP:LISTEN >/dev/null 2>&1" || true
   fi
 
   _ensure_hammerspoon
@@ -566,9 +569,9 @@ cmd_exec_voice() {
   _await_ollama || exit 1
   _wait_for "harness /health" _health || exit 1
   if _port_up "$GLOW_PORT"; then
-    lsof -ti "tcp:$GLOW_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
+    _kill_pids "bridge" $(_port_pids "$GLOW_PORT")
     rm -f "$RUN_DIR/bridge.pid"
-    _wait_for ":${GLOW_PORT} free" bash -c "! lsof -ti tcp:${GLOW_PORT} >/dev/null 2>&1" || true
+    _wait_for ":${GLOW_PORT} free" bash -c "! lsof -ti tcp:${GLOW_PORT} -sTCP:LISTEN >/dev/null 2>&1" || true
   fi
   _reconnect_overlay   # once the loop binds :8770, reconnect the glow to it
   cd "$REPO_ROOT/voice" && exec env \
