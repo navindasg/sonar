@@ -64,15 +64,58 @@ RUN_DIR="$SONAR_HOME/run"
 SONAR_SH="$REPO_ROOT/scripts/sonar.sh"
 
 # --- helpers ----------------------------------------------------------------
-_port_up()  { lsof -ti "tcp:$1" >/dev/null 2>&1; }
-_health()   { curl -sf "http://127.0.0.1:${HARNESS_PORT}/health" 2>/dev/null; }
+# Scoped to LISTEN: a bare `lsof -ti tcp:PORT` also matches CLIENTS of that port
+# (the Hammerspoon overlay's socket to :8770, say), so the unscoped form reports
+# "up" for a dead server that still has a lingering peer, and — worse — hands
+# those client PIDs to the `kill` in cmd_down.
+_port_up()   { lsof -ti "tcp:$1" -sTCP:LISTEN >/dev/null 2>&1; }
+_port_pids() { lsof -ti "tcp:$1" -sTCP:LISTEN 2>/dev/null || true; }
+_health()    { curl -sf "http://127.0.0.1:${HARNESS_PORT}/health" 2>/dev/null; }
+_agent_loaded() { launchctl list "$1" >/dev/null 2>&1; }
 
-# Spawn a command fully detached from THIS shell: the subshell backgrounds it
-# and exits immediately, so nohup's child is orphaned (reparented to launchd)
-# and survives us. Its PID is recorded for status/down.
+# Spawn a command fully detached from THIS shell: the backgrounded subshell
+# exec's into the service, so the recorded PID *is* the service (not a wrapper),
+# and it reparents to launchd once we exit. Three details carry the detachment:
+#   set -m     job control puts the job in its OWN process group, so a
+#              session-wide `kill -- -PGID` from an editor/agent can't reap it.
+#   exec       the subshell BECOMES the service, so $! is the real PID.
+#   </dev/null a background process group that reads the terminal takes SIGTTIN
+#              and STOPS (state T); the port then never binds and _wait_for
+#              reports a confusing timeout instead of a crash with a log line.
+# This closes the window AFTER we return. It does NOT save the child from a
+# reaper that walks the process tree while `up` is still running — at that
+# moment the child is still our descendant.
 _spawn() {
   local pidfile="$1" logfile="$2"; shift 2
-  ( cd "$REPO_ROOT" && nohup "$@" >"$logfile" 2>&1 & echo $! >"$pidfile" )
+  # Keep one generation of evidence: truncating on every start throws away the
+  # log of the run that just died, which is exactly the run worth reading.
+  [ -s "$logfile" ] && mv -f "$logfile" "$logfile.1"
+  printf -- '--- started %s ---\n' "$(date -Iseconds)" >"$logfile"
+  set -m
+  ( cd "$REPO_ROOT" && exec nohup "$@" </dev/null >>"$logfile" 2>&1 ) &
+  echo $! >"$pidfile"
+  set +m
+}
+
+# Report what we are about to kill, so a SIGTERM is never anonymous. Callers
+# pass the pids UNQUOTED so each becomes its own argument.
+_kill_pids() {  # <label> <pids...>
+  local label="$1"; shift
+  local pid
+  for pid in "$@"; do
+    echo "  killing ${label} pid ${pid}: $(ps -o command= -p "$pid" 2>/dev/null | cut -c1-90)"
+    kill "$pid" 2>/dev/null || true
+  done
+}
+
+# True when a LIVE voice loop owns :$GLOW_PORT — a session the user is in the
+# middle of, possibly recording a meeting whose transcript exists only in that
+# process. Callers must refuse to SIGTERM it behind the user's back.
+_voice_loop_holder() {
+  local pid; pid="$(_port_pids "$GLOW_PORT" | head -1)"
+  [ -n "$pid" ] || return 1
+  ps -o command= -p "$pid" 2>/dev/null | grep -q "voice_loop.py" || return 1
+  echo "$pid"
 }
 
 _hs_installed() { [ -d "/Applications/Hammerspoon.app" ] || [ -d "$HOME/Applications/Hammerspoon.app" ]; }
@@ -167,13 +210,31 @@ _remove_agent() {  # <installed-dst>
 _free_manual() {
   if _port_up "$2"; then
     echo "stopping manual $1 on :$2 (agent will take it) ..."
-    lsof -ti "tcp:$2" 2>/dev/null | xargs kill 2>/dev/null || true
+    _kill_pids "$1" $(_port_pids "$2")
     rm -f "$RUN_DIR/$3"; sleep 1
   fi
 }
 
 # Start the harness daemon on :$HARNESS_PORT if it isn't already up.
 _start_harness() {
+  # When the launchd agent owns the harness, never _spawn a competitor for the
+  # port: KeepAlive would respawn its own instance and the two would fight,
+  # leaving the agent crash-looping. Wait for the agent's own health instead —
+  # _health, not _port_up, because a bound port doesn't prove THIS harness
+  # bound it.
+  if _agent_loaded com.sonar.harness; then
+    if _health >/dev/null; then
+      echo "harness already up on :${HARNESS_PORT} (launchd agent)"
+      return 0
+    fi
+    echo "waiting for the com.sonar.harness agent on :${HARNESS_PORT} ..."
+    _wait_for "harness /health" _health || {
+      echo "  agent installed but unhealthy — see $LOG_DIR/harness.err.log" >&2
+      exit 1
+    }
+    echo "  harness ready."
+    return 0
+  fi
   if _port_up "$HARNESS_PORT"; then
     echo "harness already up on :${HARNESS_PORT}"
     return 0
@@ -277,11 +338,23 @@ cmd_google_auth() {
 }
 
 cmd_down() {
-  local p pids
+  local p pids agent
   for p in "$HARNESS_PORT" "$GLOW_PORT"; do
-    pids="$(lsof -ti "tcp:$p" 2>/dev/null || true)"
+    # A KeepAlive agent respawns whatever we kill, so SIGTERMing its port is a
+    # race we lose noisily. Stop the job properly instead.
+    case "$p" in
+      "$HARNESS_PORT") agent=com.sonar.harness ;;
+      *)               agent=com.sonar.bridge ;;
+    esac
+    if _agent_loaded "$agent"; then
+      echo "stopping ${agent} (launchd) ..."
+      launchctl bootout "gui/$(id -u)/${agent}" 2>/dev/null \
+        || echo "  ! bootout failed — use 'daemon uninstall' to remove it" >&2
+      continue
+    fi
+    pids="$(_port_pids "$p")"
     if [ -n "$pids" ]; then
-      echo "$pids" | xargs kill 2>/dev/null || true
+      _kill_pids ":$p" $pids
       echo "stopped :$p"
     else
       echo ":$p not running"
@@ -303,10 +376,18 @@ cmd_status() {
   fi
 }
 
+# The manual (`up`) topology and the launchd topology write DIFFERENT files:
+# _spawn writes <svc>.log, while the agents write <svc>.out.log / <svc>.err.log
+# (see scripts/launchd/*.plist). Tailing only the first set shows an empty
+# screen whenever the daemons are the thing actually running. -F (not -f) so a
+# log rotated by _spawn is reopened instead of going permanently silent.
 cmd_logs() {
   mkdir -p "$LOG_DIR"
-  : >>"$LOG_DIR/harness.log"; : >>"$LOG_DIR/bridge.log"
-  tail -n 20 -f "$LOG_DIR/harness.log" "$LOG_DIR/bridge.log"
+  local svc
+  for svc in harness bridge voice; do
+    : >>"$LOG_DIR/$svc.log"; : >>"$LOG_DIR/$svc.out.log"; : >>"$LOG_DIR/$svc.err.log"
+  done
+  tail -n 20 -F "$LOG_DIR"/{harness,bridge,voice}.{log,out.log,err.log}
 }
 
 # Preflight self-check: verifies the whole stack (Ollama + required models,
@@ -512,6 +593,22 @@ cmd_daemon() {
   local hdst="$la/com.sonar.harness.plist"
   local bdst="$la/com.sonar.bridge.plist"
   local vdst="$la/com.sonar.voice.plist"
+  # Both install paths free :$GLOW_PORT by killing whoever holds it. If that is a
+  # live voice loop, the SIGTERM also takes any meeting it is recording, whose
+  # transcript exists only in that process. Refuse BEFORE any destructive step —
+  # checking inside _free_manual would abort with the harness already killed and
+  # no agent installed, which is worse than not starting.
+  case "$action" in
+    install|install-voice)
+      local holder; holder="$(_voice_loop_holder || true)"
+      if [ -n "$holder" ] && [ "${2:-}" != "--force" ]; then
+        echo "voice loop is LIVE on :${GLOW_PORT} (pid ${holder}):" >&2
+        echo "  $(ps -o command= -p "$holder" 2>/dev/null | cut -c1-90)" >&2
+        echo "Ctrl-C it first (a recording meeting would be lost), or re-run with --force." >&2
+        exit 1
+      fi
+      ;;
+  esac
   case "$action" in
     install)
       # The durable typed-overlay stack: harness (+ RAG/tools) and the bridge that
@@ -575,7 +672,17 @@ main() {
   case "$sub" in
     up)      cmd_up ;;
     down)    cmd_down ;;
-    restart) cmd_down; echo; cmd_up ;;
+    # Bouncing a launchd job is kickstart's job. Going through down+up would
+    # SIGTERM the port and then race KeepAlive's respawn for it.
+    restart)
+      if _agent_loaded com.sonar.harness; then
+        echo "bouncing com.sonar.harness (launchd) ..."
+        launchctl kickstart -k "gui/$(id -u)/com.sonar.harness"
+        _wait_for "harness /health" _health || exit 1
+        echo "  harness ready."
+      else
+        cmd_down; echo; cmd_up
+      fi ;;
     status)  cmd_status ;;
     doctor)  cmd_doctor "$@" ;;
     setup)   cmd_setup ;;
