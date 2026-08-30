@@ -14,6 +14,13 @@ enum BridgeEvent {
     case step(kind: String, tool: String, detail: String, status: String)
     /// `{"answer": "<delta>", "partial": bool}` — streamed answer text.
     case answer(String)
+    /// `{"transcript": "...", "partial": bool}` — live/final STT into the box.
+    /// Voice loop only; bridge.py never sends it.
+    case transcript(String, partial: Bool)
+    /// `{"summon": true, "text": "..."}` — a PROACTIVE push (the morning brief).
+    /// Voice loop only. This is the one path where the bar appears without the
+    /// user asking, so it must never steal focus.
+    case summon(text: String)
 }
 
 /// WebSocket client for the overlay bridge on `:8770`.
@@ -32,6 +39,9 @@ final class BridgeClient: NSObject, URLSessionWebSocketDelegate {
     private var task: URLSessionWebSocketTask?
     private var reconnectAttempt = 0
     private var intentionallyClosed = false
+    /// A cmd frame that could not be sent because the handshake was still in
+    /// flight; flushed by didOpenWithProtocol. See send(command:).
+    private var pendingCommand: String?
 
     /// Delivered on the main thread.
     var onEvent: ((BridgeEvent) -> Void)?
@@ -65,6 +75,7 @@ final class BridgeClient: NSObject, URLSessionWebSocketDelegate {
 
     func disconnect() {
         intentionallyClosed = true
+        pendingCommand = nil
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         isConnected = false
@@ -79,10 +90,27 @@ final class BridgeClient: NSObject, URLSessionWebSocketDelegate {
         return send(json: ["text": text], on: task)
     }
 
-    /// `{"cmd":"start"|"stop"}` — box opened/closed. Glow-only and acked.
+    /// `{"cmd":"start"|"stop"}` — box opened/closed.
+    ///
+    /// Unlike `send(text:)` this DOES queue while the handshake is in flight.
+    /// `connect()` only calls `resume()`, and `isConnected` cannot flip until
+    /// `didOpenWithProtocol` is delivered on the main queue — which cannot
+    /// preempt the caller's own main-queue block. So a `show()` that connects
+    /// and immediately sends would drop the frame EVERY first time, not just
+    /// occasionally. Under the voice loop that means the mic never turns on.
+    ///
+    /// Queueing is right here where it is wrong for a question: a command is a
+    /// session marker that is still true a few milliseconds later, whereas a
+    /// queued question would fire later, out of the context the user asked it in.
+    /// Only the LAST command is kept — start-then-stop must not resurrect a
+    /// session the user already closed.
     @discardableResult
     func send(command: String) -> Bool {
-        guard isConnected, let task = task else { return false }
+        guard isConnected, let task = task else {
+            pendingCommand = command
+            return false
+        }
+        pendingCommand = nil
         return send(json: ["cmd": command], on: task)
     }
 
@@ -136,6 +164,12 @@ final class BridgeClient: NSObject, URLSessionWebSocketDelegate {
         if let answer = obj["answer"] as? String {
             emit(.answer(answer))
         }
+        if let transcript = obj["transcript"] as? String {
+            emit(.transcript(transcript, partial: obj["partial"] as? Bool ?? false))
+        }
+        if obj["summon"] as? Bool == true {
+            emit(.summon(text: obj["text"] as? String ?? ""))
+        }
     }
 
     private func emit(_ event: BridgeEvent) {
@@ -160,6 +194,10 @@ final class BridgeClient: NSObject, URLSessionWebSocketDelegate {
                     didOpenWithProtocol proto: String?) {
         reconnectAttempt = 0
         isConnected = true
+        if let command = pendingCommand {
+            pendingCommand = nil
+            send(command: command)
+        }
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,

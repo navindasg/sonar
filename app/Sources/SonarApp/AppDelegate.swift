@@ -88,7 +88,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // deliberately NOT one init.lua binds. The bridge serves each connection
         // independently and replies only to the sender, so two clients do not
         // interfere.
-        let commandBar = CommandBarController(bridgeURL: config.bridgeSocketURL)
+        let commandBar = CommandBarController(bridgeURL: config.bridgeSocketURL,
+                                              summonLingerS: config.summonLingerS)
         self.commandBar = commandBar
 
         if let combo = GlobalHotKey.Combo.parse(config.barHotKey) {

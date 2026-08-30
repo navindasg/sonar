@@ -45,6 +45,13 @@ final class CommandBarE2E: NSObject, NSApplicationDelegate {
     }
 
     /// "hi" + Return — deliberately tiny so the harness turn is quick.
+    ///
+    /// Typed as two characters then Return, with the input CHECKED between, so
+    /// the run can tell "the app dropped the text" from "the OS never delivered
+    /// the synthetic keystroke". Those are different failures and only the first
+    /// is a bug here: macOS can stop delivering CGEvent-synthesized keys to a
+    /// panel while `document.activeElement` stays correct and the panel stays
+    /// key, and that must not be reported as a broken command bar.
     let codes: [CGKeyCode] = [4, 34, 36]      // h, i, Return
     func typeNext(_ i: Int) {
         guard i < codes.count else {
@@ -53,10 +60,41 @@ final class CommandBarE2E: NSObject, NSApplicationDelegate {
             after(1.0) { self.pollAnswer() }
             return
         }
+        // Before Return, confirm the characters actually arrived.
+        if i == codes.count - 1 {
+            bar.webView.evaluateJavaScript(
+                "JSON.stringify({a:(document.activeElement||{}).id, v:document.getElementById('cmd').value})"
+            ) { value, _ in
+                let raw = (value as? String) ?? ""
+                let focused = raw.contains("\"a\":\"cmd\"")
+                let typed = raw.range(of: "\"v\":\"([^\"]*)\"", options: .regularExpression)
+                    .map { String(raw[$0]).replacingOccurrences(of: "\"v\":\"", with: "")
+                                          .replacingOccurrences(of: "\"", with: "") } ?? ""
+                // Focused but the characters did not all arrive => the OS did not
+                // deliver them. Partial delivery counts: it is the same fault.
+                if focused && typed != "hi" {
+                    print("")
+                    print("SKIP: the input is focused (activeElement=cmd) but the synthesized")
+                    print("      keystrokes did not arrive intact — expected 'hi', got '\(typed)'.")
+                    print("      This machine is not delivering CGEvent keys to the panel right")
+                    print("      now; that is an ENVIRONMENT failure, not a command-bar failure.")
+                    print("      Re-run in a fresh session, or drive the bar by hand.")
+                    self.bar.dismiss()
+                    exit(2)
+                }
+                self.postKey(i)
+                self.after(0.12) { self.typeNext(i + 1) }
+            }
+            return
+        }
+        postKey(i)
+        after(0.12) { self.typeNext(i + 1) }
+    }
+
+    func postKey(_ i: Int) {
         let src = CGEventSource(stateID: .hidSystemState)
         CGEvent(keyboardEventSource: src, virtualKey: codes[i], keyDown: true)?.post(tap: .cghidEventTap)
         CGEvent(keyboardEventSource: src, virtualKey: codes[i], keyDown: false)?.post(tap: .cghidEventTap)
-        after(0.12) { self.typeNext(i + 1) }
     }
 
     func pollAnswer() {

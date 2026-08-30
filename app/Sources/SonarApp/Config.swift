@@ -39,6 +39,9 @@ struct Config {
     /// (init.lua takes F13 and cmd+alt+ctrl+g). Set this to "f13" once the Lua
     /// bar is retired.
     let barHotKey: String
+    /// SONAR_SUMMON_LINGER_S (default 30) — how long a PROACTIVE push (the
+    /// morning brief) stays on screen before retiring itself.
+    let summonLingerS: TimeInterval
     /// SONAR_VAULT_PATH (default ~/Documents/Obsidian Vault).
     let vaultPath: String
     /// SONAR_OLLAMA_URL (default http://127.0.0.1:11434).
@@ -96,6 +99,7 @@ struct Config {
         let bridgeSocketURL = URL(string: "ws://127.0.0.1:\(bridgePort)/")
             ?? URL(string: "ws://127.0.0.1:8770/")!
         let barHotKey = value("SONAR_BAR_HOTKEY") ?? "cmd+alt+ctrl+b"
+        let summonLingerS = value("SONAR_SUMMON_LINGER_S").flatMap { TimeInterval($0) } ?? 30
 
         let vaultPath = value("SONAR_VAULT_PATH")
             ?? (NSHomeDirectory() + "/Documents/Obsidian Vault")
@@ -118,6 +122,7 @@ struct Config {
             bridgeProbeURL: bridgeProbeURL,
             bridgeSocketURL: bridgeSocketURL,
             barHotKey: barHotKey,
+            summonLingerS: summonLingerS,
             vaultPath: vaultPath,
             ollamaURL: ollamaURL,
             repoRoot: repoRoot,
