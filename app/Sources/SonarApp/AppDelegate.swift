@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var watcher: NotesURLWatcher?
     private var health: HealthPoller?
     private var services: ServiceProbe?
+    private var feeds: FeedPoller?
     private var backend: NotesBackend?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -49,6 +50,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         self.services = services
 
+        // /nudges + /events — the two harness endpoints the popover surfaces.
+        // Pull-only: this poller runs ONLY while the popover is on screen, and
+        // its results are never turned into a notification, badge, or spoken
+        // line. A 163-day-overdue to-do is something you find when you look, not
+        // something Sonar interrupts you with.
+        let feeds = FeedPoller(nudgesURL: config.nudgesURL, eventsURL: config.eventsURL)
+        feeds.onUpdate = { [weak self] snapshot in
+            self?.statusItem?.setFeeds(snapshot)
+        }
+        self.feeds = feeds
+
         // Poll ONLY while the popover is on screen — its WebView is the sole
         // consumer, so an always-on 5s timer would spend the app's whole
         // lifetime hitting three localhost ports nobody is looking at (and each
@@ -60,9 +72,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if visible {
                 self.health?.start()
                 self.services?.start()
+                self.feeds?.start()
             } else {
                 self.health?.stop()
                 self.services?.stop()
+                self.feeds?.stop()
             }
         }
 
@@ -110,6 +124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         watcher?.stop()
         health?.stop()
         services?.stop()
+        feeds?.stop()
         backend?.terminate()
     }
 }

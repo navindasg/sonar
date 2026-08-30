@@ -20,6 +20,10 @@ struct Config {
     let harnessURL: URL
     /// <harnessURL>/health.
     let healthURL: URL
+    /// <harnessURL>/nudges — the pull-only nudge surface. GET, no params.
+    let nudgesURL: URL
+    /// <harnessURL>/events?limit=N — durable step-event history.
+    let eventsURL: URL
     /// http://127.0.0.1:<SONAR_GLOW_PORT|8770> — the overlay bridge socket, hit
     /// with a plain GET purely for a liveness probe. It proves only that :8770
     /// is bound, by EITHER of its two mutually exclusive owners (overlay/bridge.py
@@ -59,6 +63,22 @@ struct Config {
         let harnessURL = URL(string: harnessString)
             ?? URL(string: "http://127.0.0.1:8787")!
         let healthURL = harnessURL.appendingPathComponent("health")
+        let nudgesURL = harnessURL.appendingPathComponent("nudges")
+
+        // `limit` selects the NEWEST N and the response is then reversed to
+        // oldest-first. Never send 0: /events clamps to [1, 2000], so limit=0
+        // returns ONE event rather than none. The fallback drops the query
+        // rather than the URL — a missing limit yields the server default of
+        // 100, which the render cap then trims, so the degraded path is correct.
+        var eventsComponents = URLComponents(
+            url: harnessURL.appendingPathComponent("events"),
+            resolvingAgainstBaseURL: false
+        )
+        eventsComponents?.queryItems = [
+            URLQueryItem(name: "limit", value: String(ActivityFeed.requestLimit))
+        ]
+        let eventsURL = eventsComponents?.url
+            ?? harnessURL.appendingPathComponent("events")
 
         let bridgePort = value("SONAR_GLOW_PORT").flatMap { Int($0) } ?? 8770
         let bridgeProbeURL = URL(string: "http://127.0.0.1:\(bridgePort)/")
@@ -80,6 +100,8 @@ struct Config {
             notesURL: notesURL,
             harnessURL: harnessURL,
             healthURL: healthURL,
+            nudgesURL: nudgesURL,
+            eventsURL: eventsURL,
             bridgeProbeURL: bridgeProbeURL,
             vaultPath: vaultPath,
             ollamaURL: ollamaURL,
