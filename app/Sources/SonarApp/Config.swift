@@ -29,6 +29,16 @@ struct Config {
     /// is bound, by EITHER of its two mutually exclusive owners (overlay/bridge.py
     /// or the voice loop, which serves the same socket instead of it).
     let bridgeProbeURL: URL
+    /// ws://127.0.0.1:<SONAR_GLOW_PORT|8770> — the overlay bridge socket the
+    /// native command bar speaks (same protocol as the Hammerspoon overlay).
+    let bridgeSocketURL: URL
+    /// SONAR_BAR_HOTKEY — the combination that summons the native command bar.
+    ///
+    /// Defaults to a combination the Hammerspoon overlay does NOT bind, so the
+    /// native bar and the Lua bar can run side by side during the transition
+    /// (init.lua takes F13 and cmd+alt+ctrl+g). Set this to "f13" once the Lua
+    /// bar is retired.
+    let barHotKey: String
     /// SONAR_VAULT_PATH (default ~/Documents/Obsidian Vault).
     let vaultPath: String
     /// SONAR_OLLAMA_URL (default http://127.0.0.1:11434).
@@ -83,6 +93,9 @@ struct Config {
         let bridgePort = value("SONAR_GLOW_PORT").flatMap { Int($0) } ?? 8770
         let bridgeProbeURL = URL(string: "http://127.0.0.1:\(bridgePort)/")
             ?? URL(string: "http://127.0.0.1:8770/")!
+        let bridgeSocketURL = URL(string: "ws://127.0.0.1:\(bridgePort)/")
+            ?? URL(string: "ws://127.0.0.1:8770/")!
+        let barHotKey = value("SONAR_BAR_HOTKEY") ?? "cmd+alt+ctrl+b"
 
         let vaultPath = value("SONAR_VAULT_PATH")
             ?? (NSHomeDirectory() + "/Documents/Obsidian Vault")
@@ -103,6 +116,8 @@ struct Config {
             nudgesURL: nudgesURL,
             eventsURL: eventsURL,
             bridgeProbeURL: bridgeProbeURL,
+            bridgeSocketURL: bridgeSocketURL,
+            barHotKey: barHotKey,
             vaultPath: vaultPath,
             ollamaURL: ollamaURL,
             repoRoot: repoRoot,

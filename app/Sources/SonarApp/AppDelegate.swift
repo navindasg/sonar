@@ -14,6 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var services: ServiceProbe?
     private var feeds: FeedPoller?
     private var backend: NotesBackend?
+    private var commandBar: CommandBarController?
+    private var barHotKey: GlobalHotKey?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let notesWindow = NotesWindowController()
@@ -80,6 +82,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // The native F5 command bar — phase 2 of moving off Hammerspoon. It
+        // speaks the same :8770 protocol and renders the same page as the Lua
+        // overlay, so the two can run side by side: the default hotkey here is
+        // deliberately NOT one init.lua binds. The bridge serves each connection
+        // independently and replies only to the sender, so two clients do not
+        // interfere.
+        let commandBar = CommandBarController(bridgeURL: config.bridgeSocketURL)
+        self.commandBar = commandBar
+
+        if let combo = GlobalHotKey.Combo.parse(config.barHotKey) {
+            let hotKey = GlobalHotKey(combo: combo) { [weak self] in
+                self?.commandBar?.toggle()
+            }
+            // Registration is checkable; FIRING is not automatable (synthesized
+            // CGEvents do not match registered hotkeys), so a failure here is
+            // the only signal we get and must not be swallowed.
+            if let reason = hotKey.register() {
+                NSLog("[Sonar] command-bar hotkey '\(config.barHotKey)' unavailable: \(reason)")
+            } else {
+                NSLog("[Sonar] command bar on \(config.barHotKey)")
+                self.barHotKey = hotKey
+            }
+        } else {
+            NSLog("[Sonar] SONAR_BAR_HOTKEY '\(config.barHotKey)' is not a valid combination; command bar has no hotkey")
+        }
+
         // notes.url appearing/updating means the page is already serveable —
         // raise the window at whatever URL it names.
         let watcher = NotesURLWatcher(fileURL: config.notesUrlFile)
@@ -125,6 +153,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         health?.stop()
         services?.stop()
         feeds?.stop()
+        barHotKey?.unregister()
+        commandBar?.dismiss()
         backend?.terminate()
     }
 }
