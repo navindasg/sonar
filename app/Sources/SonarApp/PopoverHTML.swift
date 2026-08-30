@@ -10,8 +10,17 @@ import Foundation
 ///   • buttons `post('open-notes' | 'quit')` via the "sonar" message handler;
 ///   • `post('__h__:<px>')` reports document height so the popover can size to fit;
 ///   • Swift pushes live data with `window.sonarPopover.apply({...})`.
-/// The page renders honest data only — the three localhost services (probed for
-/// liveness) and the harness `/health` doctor line. No fabricated activity feed.
+/// The page renders honest data only: probed liveness of the three localhost
+/// services, the harness `/health` doctor line, and the harness's own `/nudges`
+/// and `/events` readings. Nothing here is synthesized. Every row comes from a
+/// response received in the CURRENT popover session; "nothing reported", "can't
+/// reach the harness" and "snapshot expired" are three visibly different
+/// renders; and no timestamp, nudge line, or count is ever invented. Swift
+/// refuses to serialize rows for a stale or unreachable reading, so this page
+/// has nothing to render in those states even if it tried.
+///
+/// (The activity feed was dropped from the original design because no `/events`
+/// source existed. It exists now — that is why the section is here.)
 enum PopoverHTML {
     static let width = 340
 
@@ -23,7 +32,7 @@ enum PopoverHTML {
   --line:#23313F; --line-hair:rgba(255,255,255,0.06); --line-cut:rgba(0,0,0,0.60);
   --text-high:#E9EEF5; --text-dim:#7F8D9E; --text-faint:#556579;
   --accent:#E9A64A; --accent-ink:#241704; --accent-glow:#FFC061;
-  --steel:#69A6CC; --positive:#5CB98E; --danger:#DC4C5A;
+  --steel:#69A6CC; --positive:#5CB98E; --danger:#DC4C5A; --s3:#C9A65C;
   --font-display:"SF Pro Display",-apple-system,system-ui,sans-serif;
   --font-instr:"SF Compact Display","SF Compact Text",-apple-system,system-ui,sans-serif;
   --font-body:-apple-system,"SF Pro Text",system-ui,sans-serif;
@@ -95,6 +104,34 @@ svg{ fill:none; stroke:currentColor; stroke-width:1.25; stroke-linecap:round; st
 .doctor .txt{ font-family:var(--font-mono); font-size:12px; line-height:1.5; letter-spacing:0.02em; color:var(--text-dim); font-variant-numeric:tabular-nums; }
 .doctor .txt b{ color:var(--text-high); font-weight:600; }
 
+/* nudge rows — .svc geometry with a severity dot and a wrapping line */
+.nudge{ display:flex; align-items:flex-start; gap:10px; padding:7px 0; }
+.nudge + .nudge{ border-top:1px solid rgba(255,255,255,0.03); }
+.nudge .sev{ width:8px; height:8px; border-radius:50%; flex:none; margin-top:5px; background:var(--text-faint); box-shadow:inset 0 0 0 1px rgba(255,255,255,0.06); }
+.nudge .sev.high{ background:var(--s3); box-shadow:inset 0 0 0 1px rgba(255,255,255,0.12); }
+.nudge .sev.medium{ background:var(--text-dim); }
+.nudge .line{ min-width:0; font-size:13px; font-weight:600; letter-spacing:-0.01em; color:var(--text-high); line-height:1.38; overflow-wrap:anywhere; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; }
+
+/* activity rows — the F5 bar's #steps log idiom: zebra, no rules, all mono */
+.ev{ display:flex; align-items:center; gap:9px; padding:5px 7px; border-radius:7px; font-family:var(--font-mono); font-size:12px; line-height:1.5; }
+.ev:nth-child(even){ background:rgba(255,255,255,0.015); }
+.ev .ico{ width:15px; height:15px; flex:none; color:var(--text-dim); }
+.ev.ok .ico{ color:var(--positive); }
+.ev.err .ico, .ev.err .id, .ev.err .det{ color:var(--danger); }
+.ev .id{ flex:none; max-width:118px; color:var(--text-high); letter-spacing:0.02em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.ev .det{ flex:1; min-width:0; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.ev .age{ margin-left:auto; flex:none; padding-left:6px; color:var(--text-faint); font-variant-numeric:tabular-nums; }
+
+/* shared: the not-a-row renders */
+.empty{ font-size:13px; color:var(--text-dim); padding:2px 0 1px; }
+.empty.faint{ color:var(--text-faint); }
+.note{ margin-top:6px; font-family:var(--font-mono); font-size:11px; letter-spacing:0.05em; color:var(--text-faint); font-variant-numeric:tabular-nums; }
+
+/* Inert safety rails. The JS caps are the real bound; these engage only if a
+   cap is ever bypassed, and they scroll rather than clip so nothing is hidden. */
+#nudgeList{ max-height:168px; overflow-y:auto; }
+#evList{ max-height:96px; overflow-y:auto; }
+
 /* actions */
 .btn{ width:100%; height:40px; display:inline-flex; align-items:center; justify-content:center; gap:8px; border-radius:var(--r-control); font-family:var(--font-body); font-weight:600; cursor:pointer; user-select:none; transition:filter .12s ease, box-shadow .12s ease, background .12s ease, border-color .12s ease, transform .12s ease; }
 .btn svg{ width:16px; height:16px; flex:none; }
@@ -133,6 +170,12 @@ svg{ fill:none; stroke:currentColor; stroke-width:1.25; stroke-linecap:round; st
     </div>
 
     <div class="sect">
+      <div class="eyebrow"><span class="lbl">Needs you</span><span class="aux" id="nudgeAux">—</span></div>
+      <div id="nudgeList"></div>
+      <div class="note" id="nudgeNote" hidden></div>
+    </div>
+
+    <div class="sect">
       <div class="eyebrow"><span class="lbl">Stack status</span><span class="aux">127.0.0.1</span></div>
       <div class="svc">
         <span class="dot" id="dHarness"></span>
@@ -153,6 +196,11 @@ svg{ fill:none; stroke:currentColor; stroke-width:1.25; stroke-linecap:round; st
         <span class="pd"></span>
         <span class="txt" id="doctorText">Reading harness health…</span>
       </div>
+    </div>
+
+    <div class="sect">
+      <div class="eyebrow"><span class="lbl">Activity</span><span class="aux" id="evAux">—</span></div>
+      <div id="evList"></div>
     </div>
 
     <div class="sect">
@@ -186,8 +234,186 @@ svg{ fill:none; stroke:currentColor; stroke-width:1.25; stroke-linecap:round; st
   document.getElementById('openNotes').addEventListener('click', function(){ post('open-notes'); });
   document.getElementById('quit').addEventListener('click', function(){ post('quit'); });
 
-  function cls(el, on, off){ el.classList.remove(on, off); }
-  function apply(s){
+  var NUDGE_MAX=3, EV_MAX=3;
+  var SVGNS='http://www.w3.org/2000/svg';
+
+  function clear(el){ while(el.firstChild) el.removeChild(el.firstChild); }
+  function mk(tag, cls){ var n=document.createElement(tag); if(cls) n.className=cls; return n; }
+  function txt(tag, cls, s){ var n=mk(tag,cls); n.textContent = (s==null?'':String(s)); return n; }
+
+  // Monoline 16x16 glyphs, built node-by-node so this file has zero innerHTML
+  // sinks (grep-checkable). className is an SVGAnimatedString on SVG elements,
+  // so the class MUST go through setAttribute — assigning .className no-ops.
+  var GL={
+    turn_start:   ['M8 3.2v9.6','M4.4 7.2 8 3.4l3.6 3.8'],
+    tool:         ['M6.4 2.8 3.2 8l3.2 5.2','M9.6 2.8 12.8 8l-3.2 5.2'],
+    tool_result_summary: ['M3.6 8h5.2','M3.6 4.8h8.8','M3.6 11.2h6.8'],
+    model_switch: ['M3.2 6h7.2l-2-2','M12.8 10H5.6l2 2'],
+    final:        ['M3.2 8.4l3 3 6.6-6.8'],
+    unknown:      ['M4 8h8']
+  };
+  function glyph(kind){
+    // `step` is nullable and NOT a closed enum on the wire — the harness logs an
+    // unrecognized step and stores it anyway. A raw server string used as an
+    // object key would otherwise reach Object.prototype ('constructor',
+    // 'toString', '__proto__') and return a function, which would throw
+    // mid-render.
+    var paths = Object.prototype.hasOwnProperty.call(GL, kind) ? GL[kind] : GL.unknown;
+    var s=document.createElementNS(SVGNS,'svg');
+    s.setAttribute('viewBox','0 0 16 16');
+    s.setAttribute('aria-hidden','true');
+    s.setAttribute('class','ico');
+    for(var i=0;i<paths.length;i++){
+      var p=document.createElementNS(SVGNS,'path');
+      p.setAttribute('d', paths[i]);
+      s.appendChild(p);
+    }
+    return s;
+  }
+
+  // Age vocabulary. Two formatters, because the two values round in OPPOSITE
+  // directions and sharing one silently breaks the nudge invariant.
+  //
+  // -1 means "no honest value" in both, and prints as an em dash, never "now".
+
+  // Event ages FLOOR — the ordinary log convention, where a row reading 22d for
+  // something 22.5d old is what a reader expects.
+  function fmtAge(n){
+    if(n==null || n<0) return '—';
+    if(n<60) return n+'s';
+    if(n<3600) return Math.floor(n/60)+'m';
+    if(n<86400) return Math.floor(n/3600)+'h';
+    return Math.floor(n/86400)+'d';
+  }
+
+  // The nudge bound must CEIL, at every magnitude. Swift rounds the value up,
+  // but flooring it here would cancel that: ceil=66 through the floor formatter
+  // printed "≤1m old" for a snapshot 60.8s old — an upper bound stated LOWER
+  // than the true age, which is the one thing this number promises not to do.
+  // Seconds are kept below 120 so the common case stays precise rather than
+  // coarsening a 66s bound to "≤2m"; above that, unit conversion divides up.
+  function fmtAgeCeil(n){
+    if(n==null || n<0) return '—';
+    if(n<120) return n+'s';
+    if(n<3600) return Math.ceil(n/60)+'m';
+    if(n<86400) return Math.ceil(n/3600)+'h';
+    return Math.ceil(n/86400)+'d';
+  }
+
+  function renderNudges(n){
+    var list=document.getElementById('nudgeList');
+    var aux=document.getElementById('nudgeAux');
+    var note=document.getElementById('nudgeNote');
+    // Every branch clears first: the failure mode of an incremental renderer is
+    // exactly a stale row surviving a state transition.
+    clear(list); note.hidden=true; note.textContent='';
+    aux.textContent='—';
+
+    if(!n){ list.appendChild(txt('div','empty faint','Checking…')); return; }
+
+    if(n.state==='ok' && n.items && n.items.length){
+      aux.textContent = '≤'+fmtAgeCeil(n.ageCeilingS)+' old';
+      var k=Math.min(n.items.length, NUDGE_MAX);
+      for(var i=0;i<k;i++){
+        var it=n.items[i]||{};
+        var row=mk('div','nudge');
+        // Severity picks an ALLOWLISTED literal class. The server string is
+        // never concatenated into className, an attribute, or an id.
+        var sevCls='sev';
+        if(it.severity==='high') sevCls='sev high';
+        else if(it.severity==='medium') sevCls='sev medium';
+        row.appendChild(mk('span',sevCls));
+        // Vault-derived free text: textContent only, never HTML parsing.
+        row.appendChild(txt('div','line', it.line));
+        list.appendChild(row);
+      }
+      var hidden=(n.returned|0)-k;
+      if(hidden>0){
+        // OUR truncation, so it can be stated. Never phrased as a total: the
+        // harness already capped the list silently and its `count` is post-cap,
+        // so the true number is unknowable from here.
+        note.textContent = hidden+' more returned, not shown';
+        note.hidden=false;
+      }
+      return;
+    }
+
+    if(n.state==='ok' || n.state==='empty'){
+      // The age ceiling still prints here: a FRESH nothing is what distinguishes
+      // this from the unreachable/stale states, which show an em dash.
+      aux.textContent = '≤'+fmtAgeCeil(n.ageCeilingS)+' old';
+      // Describes the RESPONSE, not the world. The harness answers a wedged
+      // engine with a byte-identical empty snapshot, so "nothing needs you"
+      // would be a claim this surface cannot back.
+      list.appendChild(txt('div','empty','No nudges reported'));
+      return;
+    }
+    if(n.state==='unreachable'){
+      list.appendChild(txt('div','empty faint',"Can't reach the harness — nudges unknown"));
+      return;
+    }
+    if(n.state==='malformed'){
+      list.appendChild(txt('div','empty faint','Unexpected response from harness'));
+      return;
+    }
+    if(n.state==='stale'){
+      list.appendChild(txt('div','empty faint','Snapshot expired — rechecking…'));
+      return;
+    }
+    list.appendChild(txt('div','empty faint','Checking…'));
+  }
+
+  function renderActivity(a){
+    var list=document.getElementById('evList');
+    var aux=document.getElementById('evAux');
+    clear(list);
+    aux.textContent='—';
+
+    if(!a){ list.appendChild(txt('div','empty faint','Checking…')); return; }
+
+    if(a.state==='ok' && a.items && a.items.length){
+      // /events carries no staleness metadata and its retention sweep only runs
+      // on store-open and every 500 appends, so the newest row's age is stated
+      // up front rather than implied by the word "recent".
+      aux.textContent = 'newest '+fmtAge(a.newestAgeS);
+      var k=Math.min(a.items.length, EV_MAX);
+      for(var i=0;i<k;i++){
+        var it=a.items[i]||{};
+        // Allowlisted status -> literal class. Anything else stays neutral.
+        var rowCls='ev';
+        if(it.status==='ok') rowCls='ev ok';
+        else if(it.status==='error') rowCls='ev err';
+        var row=mk('div',rowCls);
+        row.appendChild(glyph(it.kind));
+        row.appendChild(txt('span','id', it.label));
+        // `detail` is absent on some steps and present-but-empty on others.
+        // Omit the span entirely rather than printing filler that would look
+        // like content.
+        if(it.detail){ row.appendChild(txt('span','det', it.detail)); }
+        row.appendChild(txt('span','age', fmtAge(it.ageS)));
+        list.appendChild(row);
+      }
+      return;
+    }
+
+    if(a.state==='ok' || a.state==='empty'){
+      // Again: describes the response. {"events":[]} also means "the durable
+      // read failed and the ring was empty", indistinguishable from here.
+      list.appendChild(txt('div','empty','No steps returned'));
+      return;
+    }
+    if(a.state==='unreachable'){
+      list.appendChild(txt('div','empty faint',"Can't reach the harness — history unknown"));
+      return;
+    }
+    if(a.state==='malformed'){
+      list.appendChild(txt('div','empty faint','Unexpected response from harness'));
+      return;
+    }
+    list.appendChild(txt('div','empty faint','Checking…'));
+  }
+
+  function renderStatus(s){
     var chip=document.getElementById('stateChip'), st=document.getElementById('stateText');
     chip.classList.remove('up','down');
     if(s.harnessUp){ chip.classList.add('up'); st.textContent='Ready'; }
@@ -218,6 +444,15 @@ svg{ fill:none; stroke:currentColor; stroke-width:1.25; stroke-linecap:round; st
     } else {
       dt.textContent='Harness offline — start the stack (sonar.sh up)';
     }
+  }
+
+  // Each section renders in isolation: an exception in one must not leave the
+  // others unpainted, and fit() must run either way so the popover never sizes
+  // itself to a half-drawn page.
+  function apply(s){
+    try{ renderStatus(s); }catch(e){ post('__err__:status'); }
+    try{ renderNudges(s && s.nudges); }catch(e){ post('__err__:nudges'); }
+    try{ renderActivity(s && s.activity); }catch(e){ post('__err__:activity'); }
     fit();
   }
   window.sonarPopover={ apply:apply };
