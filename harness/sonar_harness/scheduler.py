@@ -25,7 +25,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass
-from datetime import date, datetime, time as dtime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -165,31 +165,6 @@ def _run(cmd: list[str], *, cwd: Path, timeout: float) -> None:
 
 
 # ---- job factories -----------------------------------------------------------
-def _minutes(t: datetime | dtime) -> int:
-    return t.hour * 60 + t.minute
-
-
-def brief_job(
-    *, repo_root: Path, vault_path: Path, hour: int, minute: int, timeout: float = 300.0
-) -> Job:
-    """Morning brief: due at/after HH:MM local; done once today's vault note
-    exists (the artifact ``morning_brief.py`` writes). Runs the same proven
-    ``sonar.sh brief`` the launchd agent used."""
-    target = dtime(hour, minute)
-
-    def due(now: datetime) -> bool:
-        return _minutes(now) >= _minutes(target)
-
-    def done(now: datetime) -> bool:
-        return (vault_path / "Sonar" / "Brief" / f"{now.date().isoformat()}.md").exists()
-
-    def run() -> None:
-        _run(["/bin/bash", str(repo_root / "scripts" / "sonar.sh"), "brief"],
-             cwd=repo_root, timeout=timeout)
-
-    return Job("brief", due, done, run)
-
-
 def formatter_daily_job(
     *, python: Path, repo_root: Path, config: Path | None = None, timeout: float = 900.0
 ) -> Job:
@@ -281,15 +256,18 @@ def ensure_formatter_config(
 
 
 def default_jobs(*, vault_path: str | Path, repo_root: Path = _REPO_ROOT) -> list[Job]:
-    """The jobs the harness manages: the brief (surfaced) plus the note-formatter
-    (fire-and-forget). The formatter is Sonar's own vendored ``obsidian_rag``,
-    always scheduled — it's a required harness dependency."""
-    hour = int(os.environ.get("SONAR_BRIEF_HOUR", "8"))
-    minute = int(os.environ.get("SONAR_BRIEF_MIN", "0"))
+    """The jobs the harness manages: the note-formatter, and ONLY the formatter.
+
+    Every scheduled job must be silent and fire-and-forget. The morning brief
+    used to run here and it spoke itself aloud through the voice loop's ``say``
+    push — which on 2026-07-24 read the user's day out loud, unprompted, into a
+    live meeting. The brief is PULL-only now: ``daily.brief`` composes it when
+    the user asks (and ``sonar.sh brief`` still runs it on demand). Do not add a
+    job here that can reach the voice socket on :8770.
+    """
     python = _formatter_python()
     config = _formatter_config_path()
     return [
-        brief_job(repo_root=repo_root, vault_path=Path(vault_path), hour=hour, minute=minute),
         formatter_daily_job(python=python, repo_root=repo_root, config=config),
         formatter_tags_job(python=python, repo_root=repo_root, config=config),
     ]

@@ -20,7 +20,11 @@ Ported from the battle-tested `AI-Dasgupta/brook37` agent loop. See
 - Model router (`model_router.py`): fast `e4b` selects tools; the final grounded
   synthesis escalates to `26b` when tools were used (`config/models.yaml`).
 - Step-events at `GET /events` for the overlay "steps taken" panel
-  (`events.py`, shape in `CONTRACTS.md §3`).
+  (`events.py`, shape in `CONTRACTS.md §3`). Persisted to SQLite
+  (`event_store.py`) and filterable by `turn_id` / `since` / `limit`, so a
+  surface can read turns from before the current harness process.
+- `GET /nudges` — the silent, PULL-only "what wants my attention" surface
+  (`nudges.py`). Composes the same read tools; never speaks or schedules.
 
 Run: `SONAR_PORT=8787 uv run --project harness python -m sonar_harness`
 Tests: `uv run --project harness --extra dev pytest harness/tests -q`

@@ -5,10 +5,13 @@
 #   "websockets>=13",
 # ]
 # ///
-"""Sonar morning brief — the proactive delivery of daily.brief.
+"""Sonar morning brief — the spoken delivery of daily.brief.
 
-Runs on a schedule (launchd, via `sonar.sh brief install`) or on demand
-(`sonar.sh brief`). Three steps:
+PULL-only: you run it (`sonar.sh brief`), it never runs itself. It used to be
+scheduled, and because it speaks aloud whenever the voice loop is up, it read the
+user's day out loud into a live meeting on 2026-07-24. Both schedulers are gone
+(the launchd agent and the harness scheduler job); asking Sonar "what's on my
+plate" reaches the same brief without the ambush. Three steps:
 
   1. Ask the harness for the brief (a /v1 turn that triggers the daily.brief tool),
   2. Save it as a dated vault note (durable, reviewable, RAG-able next reindex),
@@ -38,7 +41,10 @@ VAULT = Path(
 )
 PROMPT = os.environ.get(
     "SONAR_BRIEF_PROMPT",
-    "Give me my morning brief for today, including any important unread email. "
+    # "Refresh" matters: daily.brief serves today's saved note back on a re-ask,
+    # so without it a second run would just re-narrate the first one. Running this
+    # script IS an explicit request to recompute.
+    "Give me my morning brief for today — refresh it from live sources. "
     "Keep it warm, natural, and concise — it will be read aloud.",
 )
 _SPEAK_TIMEOUT_S = 180.0

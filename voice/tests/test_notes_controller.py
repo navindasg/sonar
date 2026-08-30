@@ -194,6 +194,122 @@ async def test_end_save_and_resave(rig, tmp_path: Path) -> None:
     assert ctl.state.saved_path == str(saved.relative_to(tmp_path))
 
 
+# --- regression: a finished session must survive the process ---------------
+# 2026-08-07: a session reached REVIEW with a real transcript and a generated AI
+# overview, nobody clicked Save (the button lives only in the browser page), the
+# voice loop died overnight, and Sonar/Notes/ was never even created. end() now
+# writes the note itself; Save and Discard still mean what the UI says they do.
+
+
+def _saved_notes(vault: Path) -> list[Path]:
+    return sorted((vault / "Sonar" / "Notes").glob("*.md"))
+
+
+async def test_end_writes_the_note_before_anyone_clicks_save(rig, tmp_path: Path) -> None:
+    ctl, stt, emb = rig
+    stt.queue = ["we decided things"]
+    emb.queue = [np.array([1.0, 0.0])]
+    _speak(ctl)
+    await _drain(ctl)
+
+    await ctl.end()
+
+    written = _saved_notes(tmp_path)
+    assert len(written) == 1, "end() must persist the session, not only summarize it"
+    body = written[0].read_text(encoding="utf-8")
+    assert "we decided things" in body and "- fake overview" in body
+    # The user hasn't confirmed anything: Discard is still on offer and no
+    # "Saved to …" toast should have fired.
+    assert ctl.state.status == sess.REVIEW
+    assert ctl.state.saved_path == ""
+
+
+async def test_saving_after_the_auto_write_rewrites_the_same_file(
+    rig, tmp_path: Path
+) -> None:
+    ctl, stt, emb = rig
+    stt.queue = ["we decided things"]
+    emb.queue = [np.array([1.0, 0.0])]
+    _speak(ctl)
+    await _drain(ctl)
+    await ctl.end()
+
+    await ctl.apply_client_op({"op": "edit_summary", "markdown": "### EDITED"})
+    await ctl.save()
+
+    written = _saved_notes(tmp_path)
+    assert len(written) == 1, "Save must re-render the auto-written note, not duplicate it"
+    assert "### EDITED" in written[0].read_text(encoding="utf-8")
+    assert ctl.state.status == sess.SAVED
+    assert ctl.state.saved_path == str(written[0].relative_to(tmp_path))
+
+
+async def test_discard_from_review_removes_the_auto_written_note(
+    rig, tmp_path: Path
+) -> None:
+    # The Discard confirm promises the transcript will be lost — so the note
+    # end() wrote on the user's behalf has to go with it.
+    ctl, stt, emb = rig
+    stt.queue = ["we decided things"]
+    emb.queue = [np.array([1.0, 0.0])]
+    _speak(ctl)
+    await _drain(ctl)
+    await ctl.end()
+    assert _saved_notes(tmp_path)
+
+    await ctl.discard()
+
+    assert _saved_notes(tmp_path) == []
+    assert ctl.state.status == sess.DISCARDED
+
+
+async def test_discard_after_a_manual_save_keeps_the_users_note(
+    rig, tmp_path: Path
+) -> None:
+    ctl, stt, emb = rig
+    stt.queue = ["we decided things"]
+    emb.queue = [np.array([1.0, 0.0])]
+    _speak(ctl)
+    await _drain(ctl)
+    await ctl.end()
+    await ctl.save()
+
+    await ctl.discard()
+
+    assert len(_saved_notes(tmp_path)) == 1, "a note the user saved is theirs to keep"
+
+
+async def test_a_failed_auto_write_still_finishes_the_session(tmp_path: Path) -> None:
+    # store.save_note raises when the vault directory is missing — the very case
+    # that bit us (Sonar/Notes/ didn't exist). end() must log it and carry on:
+    # letting it escape would skip _fire_on_ended and strand the mic forever.
+    handed_back = {"n": 0}
+
+    async def on_ended() -> None:
+        handed_back["n"] += 1
+
+    stt, emb = FakeStt(), FakeEmbedder()
+    ctl = NotesController(
+        transcribe=stt, vault_path=tmp_path / "nonexistent-vault", embedder=emb,
+        open_browser=False, port=0, on_ended=on_ended,
+    )
+    ctl._summarize = _fake_summarize
+    try:
+        await ctl.start(now=datetime(2026, 7, 15, 9, 0))
+        ctl.begin_capture()
+        stt.queue = ["we decided things"]
+        emb.queue = [np.array([1.0, 0.0])]
+        _speak(ctl)
+        await _drain(ctl)
+
+        await asyncio.wait_for(ctl.end(), timeout=3.0)
+
+        assert ctl.state.status == sess.REVIEW
+        assert handed_back["n"] == 1
+    finally:
+        await ctl.aclose()
+
+
 async def test_client_ops_edit_the_session(rig) -> None:
     ctl, stt, emb = rig
     stt.queue = ["hello world"]

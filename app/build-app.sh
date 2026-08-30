@@ -33,6 +33,16 @@ cp "${BIN}" "${APP}/Contents/MacOS/SonarApp"
 cp "Info.plist" "${APP}/Contents/Info.plist"
 printf 'APPL????' > "${APP}/Contents/PkgInfo"
 
+# Stamp the checkout path so a bundle dragged out of the repo (into
+# /Applications, say) can still find voice/ for the notes backend — Config
+# reads this after its bundle/executable walks fail. The plist is re-copied
+# fresh above every build, so `Add` never collides with an existing key. Must
+# precede the codesign below, or the signature won't cover the edited plist.
+REPO_ROOT="$(dirname "${SCRIPT_DIR}")"
+/usr/libexec/PlistBuddy -c "Add :SONARRepoRoot string ${REPO_ROOT}" \
+	"${APP}/Contents/Info.plist" >/dev/null
+echo "==> stamped SONARRepoRoot=${REPO_ROOT}"
+
 # Stable ad-hoc identity so a later mic-TCC grant can stick across launches.
 if command -v codesign >/dev/null 2>&1; then
 	if codesign --force --deep --sign - "${APP}" >/dev/null 2>&1; then

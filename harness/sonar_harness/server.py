@@ -10,7 +10,9 @@ Exposes ``POST /v1/chat/completions`` with SSE streaming shaped EXACTLY as
 The tool loop runs NON-streaming (``agent.run_turn``); the grounded final
 answer is then emitted as real SSE deltas (buffered-then-streamed — see the
 design note in the task return). Step-events for the turn are exposed at
-``GET /events`` so the overlay can render the "steps taken" timeline.
+``GET /events`` so the overlay can render the "steps taken" timeline; those
+events are also persisted (``event_store``) so ``/events`` can serve history
+from before this process started — ``since``/``turn_id``/``limit`` filter it.
 
 Everything shared (registry, RAG backend, Ollama client, model config, state,
 event sink, charter) is built once at startup and held on ``app.state``.
@@ -28,12 +30,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+import anyio
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from sonar_harness.agent import run_turn
+from sonar_harness.event_store import DEFAULT_LIMIT, EventStore
 from sonar_harness.events import EventSink
 from sonar_harness.model_router import load_config as load_models_config
+from sonar_harness.nudges import NudgeEngine, empty_snapshot
 from sonar_harness.ollama_client import DEFAULT_OLLAMA_URL, OllamaChat
 from sonar_harness.prompt import load_charter
 from sonar_harness.scheduler import start_scheduler
@@ -74,7 +79,9 @@ def _build_state(app: FastAPI) -> None:
     app.state.ollama = OllamaChat(base_url=ollama_url)
     app.state.models = load_models_config(CONFIG_DIR / "models.yaml")
     app.state.state = State.open()
-    app.state.events = EventSink()
+    # try_open, not open: a DB we can't write costs history, not the harness —
+    # the sink then runs ring-only exactly as it did before.
+    app.state.events = EventSink(store=EventStore.try_open())
     app.state.charter = load_charter(CONFIG_DIR / "charter.md")
 
     # Preload the hot model so the first turn is warm (~1 s) instead of a
@@ -106,6 +113,7 @@ async def lifespan(app: FastAPI):
             app.state.scheduler.stop()
         app.state.ollama.close()
         app.state.state.close()
+        app.state.events.close()
 
 
 app = FastAPI(title="sonar-harness", lifespan=lifespan)
@@ -145,8 +153,6 @@ async def chat_completions(request: Request) -> Any:
     st = request.app.state
     # Run the (blocking) tool loop off the event loop so slow model calls don't
     # stall the server.
-    import anyio
-
     result = await anyio.to_thread.run_sync(
         lambda: run_turn(
             inbound_messages=messages,
@@ -201,9 +207,29 @@ async def chat_completions(request: Request) -> Any:
 
 
 @app.get("/events")
-async def get_events(request: Request, turn_id: str | None = None, limit: int = 100) -> Any:
+def get_events(
+    request: Request,
+    turn_id: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+    since: int | None = None,
+) -> Any:
+    """Step-event history, oldest-first, in the shape the overlay already parses.
+
+    ``turn_id``/``limit`` behave as before; ``since`` (inclusive epoch ms) is
+    the new one — a poller passes back ``last_ts + 1`` to get only what it has
+    not seen. Reads are durable-first, so a Console window can ask about a turn
+    that happened before the current harness process.
+
+    Deliberately ``def``, not ``async def``: this read now reaches SQLite behind
+    the store's lock — which the turn thread holds while it appends and while a
+    retention sweep runs — and awaiting that inline would freeze the whole event
+    loop, SSE deltas of the live answer included. Starlette runs a sync endpoint
+    in its threadpool, so a slow read costs this poll and nothing else.
+    """
     events: EventSink = request.app.state.events
-    return JSONResponse({"events": events.recent(turn_id=turn_id, limit=limit)})
+    return JSONResponse(
+        {"events": events.query(since=since, turn_id=turn_id, limit=limit)}
+    )
 
 
 @app.get("/health")
@@ -217,3 +243,33 @@ async def health(request: Request) -> Any:
             "default_model": st.models.resolve(st.models.default),
         }
     )
+
+
+@app.get("/nudges")
+async def get_nudges(request: Request) -> Any:
+    """"What wants my attention right now" — the SILENT, PULL-only surface.
+
+    Nothing here speaks, notifies, or schedules: it answers because something
+    asked, in that moment (``sonar_harness.nudges`` explains why that matters).
+    A caller POLLS this, so two rules hold: it must be cheap — the engine keeps a
+    TTL cache, so most polls are dictionary work — and it must never block the
+    turn loop, hence the worker thread. On any failure it serves an EMPTY
+    surface with 200: a menu bar has nowhere to render a 500.
+    """
+    st = request.app.state
+    engine = getattr(st, "nudges", None)
+    if engine is None:
+        # Built lazily and cached on app.state so polling reuses one engine (and
+        # one cache). No await between the read and the write, so concurrent
+        # requests cannot interleave into two engines.
+        engine = NudgeEngine(
+            vault_path=os.environ.get("SONAR_VAULT_PATH", str(DEFAULT_VAULT))
+        )
+        st.nudges = engine
+
+    try:
+        snapshot = await anyio.to_thread.run_sync(engine.snapshot)
+    except Exception as exc:  # noqa: BLE001 — absence is the only failure mode
+        log.warning("nudges unavailable (%s: %s)", type(exc).__name__, exc)
+        snapshot = empty_snapshot()
+    return JSONResponse(snapshot)

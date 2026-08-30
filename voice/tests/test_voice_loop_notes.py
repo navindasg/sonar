@@ -47,7 +47,6 @@ def _bare_loop() -> VoiceLoop:
     vl = object.__new__(VoiceLoop)
     vl.notes = FakeNotesController()
     vl._response_task = None
-    vl._notes_ws = None
     return vl
 
 
@@ -80,13 +79,13 @@ async def test_maybe_start_notes_routes_a_take_notes_command() -> None:
     vl = _bare_loop()
     calls: list[tuple] = []
 
-    async def fake_speak(ws, text: str) -> None:
+    async def fake_speak(text: str) -> None:
         calls.append(("speak", text))
 
     vl._speak_text = fake_speak
     vl.start_mic = lambda: calls.append(("mic",))
 
-    routed = vl._maybe_start_notes("WS", "take notes on the budget review")
+    routed = vl._maybe_start_notes("take notes on the budget review")
     assert routed is True                    # claimed the utterance
     await asyncio.wait_for(vl._response_task, timeout=2.0)
 
@@ -101,7 +100,7 @@ async def test_maybe_start_notes_routes_a_take_notes_command() -> None:
 async def test_maybe_start_notes_ignores_non_commands() -> None:
     vl = _bare_loop()
     # a plain question is NOT a notes command -> falls through to the harness path
-    assert vl._maybe_start_notes("WS", "what's on my calendar tomorrow") is False
+    assert vl._maybe_start_notes("what's on my calendar tomorrow") is False
     assert vl._response_task is None
 
 
@@ -109,7 +108,7 @@ async def test_maybe_start_notes_no_op_while_already_recording() -> None:
     vl = _bare_loop()
     vl.notes = FakeNotesController(recording=True, active=True)
     # already inside a live meeting: a second "take notes" must not start another
-    assert vl._maybe_start_notes("WS", "take notes") is False
+    assert vl._maybe_start_notes("take notes") is False
 
 
 def test_voice_loop_imports_without_heavy_backends() -> None:

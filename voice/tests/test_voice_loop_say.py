@@ -69,7 +69,7 @@ async def test_say_summons_the_box_on_a_DIFFERENT_client() -> None:
     glow, poker = FakeWS(), FakeWS()
     vl = _say_loop(glow, poker)
 
-    await vl._speak_text(poker, "Good morning. Two events today.")
+    await vl._speak_text("Good morning. Two events today.")
 
     for ws in (glow, poker):
         summons = [m for m in ws.sent if m.get("summon")]
@@ -81,7 +81,7 @@ async def test_say_brackets_the_push_with_turn_start_and_end() -> None:
     glow = FakeWS()
     vl = _say_loop(glow)
 
-    await vl._speak_text(glow, "hello")
+    await vl._speak_text("hello")
 
     kinds = [m.get("turn") for m in glow.sent if "turn" in m]
     assert kinds == ["start", "end"]
@@ -93,7 +93,7 @@ async def test_a_dead_socket_does_not_block_delivery_to_others() -> None:
     dead, live = FakeWS(broken=True), FakeWS()
     vl = _say_loop(dead, live)
 
-    await vl._speak_text(dead, "brief")
+    await vl._speak_text("brief")
 
     # the live glow still got the whole sequence despite the dead poker
     assert any(m.get("summon") for m in live.sent)

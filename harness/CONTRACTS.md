@@ -90,6 +90,34 @@ by the emitter for correlation. Events are additive; consumers ignore unknown fi
 | `model_switch` | Router swaps model (e4b ↔ 26b) | `"e4b→26b (tool turn)"` |
 | `final` | Answer begins streaming to TTS | `"streaming reply"` |
 
+**Reading them back — `GET /events`.** Response is always `{"events": [...]}`, oldest-first, with
+absent optional keys omitted (never serialized as `null`). Query params, all optional:
+`turn_id` (one turn), `since` (inclusive epoch-ms floor — a poller passes back `last_ts + 1`),
+`limit` (clamped 1–2000, default 100). Events are persisted (`event_store.py`), so a caller may
+ask about a turn that ran before the current harness process. Persistence is best-effort by
+design: a failed write costs history, never the turn.
+
+---
+
+## 3b. Attention surface (`GET /nudges`)
+
+Silent and PULL-only — it answers because something asked, in that moment. Never speaks,
+notifies, or schedules. Always 200, even on total failure (a menu bar has nowhere to render a
+500); the failure payload is an EMPTY surface of the same shape.
+
+```json
+{"generated_at": "<iso8601>", "age_s": 0.0, "ttl_s": 60.0, "count": 1, "nudges": [
+  {"id": "...", "source": "calendar|notes|email|todo",
+   "severity": "high|medium|low", "rank": 0,
+   "line": "<one-line human string>", "at": "<iso8601>"}]}
+```
+
+`id` is stable across polls, so a surface can own dismiss/snooze state locally. Ordering is a
+total order: severity, then source in the fixed order above (time-boxed things the user cannot
+recover if missed come first), then per-source `rank` lowest-first, then `id`. Unknown severities
+and sources sort last rather than raising. `age_s`/`ttl_s` describe the TTL cache that keeps
+polling cheap — a poll inside the TTL re-serves the same snapshot without touching any source.
+
 ---
 
 _Adaptations vs brook37: local Ollama (XML-heal fallback for flaky JSON tool-calls), synchronous

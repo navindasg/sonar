@@ -1,9 +1,10 @@
 """gmail.search — read-only search over the user's OWN Gmail.
 
-Uses the per-user OAuth credentials from ``google_auth`` (read-only scope). Never
-sends or drafts: those are a human-gated capability for a later pass (DECISIONS:
-email is draft-only, never auto-sent). Not connected yet → returns a clear
-"run google-auth" string the model can relay, rather than crashing the turn.
+Uses the per-user OAuth credentials from ``google_auth``. This module reads and
+nothing else; WRITING a message lives in ``gmail_draft.py``, which saves to
+Drafts and structurally cannot send (DECISIONS: email is draft-only, never
+auto-sent). Not connected yet → returns a clear "run google-auth" string the
+model can relay, rather than crashing the turn.
 """
 from __future__ import annotations
 
@@ -57,7 +58,8 @@ class GmailSearchTool(ToolBase):
         "quotes force an exact-phrase match and usually return nothing; only quote "
         "text the user quoted literally. If a search returns no messages, broaden "
         "and try again (drop words, drop quotes, or search from:<name> alone) "
-        "before telling the user there's nothing. Cannot send or draft email."
+        "before telling the user there's nothing. Read-only: to WRITE a message "
+        "use gmail.draft, which saves to Drafts. Nothing can send mail."
     )
     input_schema = {
         "type": "object",

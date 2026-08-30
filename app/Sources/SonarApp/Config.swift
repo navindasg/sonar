@@ -20,14 +20,20 @@ struct Config {
     let harnessURL: URL
     /// <harnessURL>/health.
     let healthURL: URL
+    /// http://127.0.0.1:<SONAR_GLOW_PORT|8770> — the overlay bridge socket, hit
+    /// with a plain GET purely for a liveness probe. It proves only that :8770
+    /// is bound, by EITHER of its two mutually exclusive owners (overlay/bridge.py
+    /// or the voice loop, which serves the same socket instead of it).
+    let bridgeProbeURL: URL
     /// SONAR_VAULT_PATH (default ~/Documents/Obsidian Vault).
     let vaultPath: String
     /// SONAR_OLLAMA_URL (default http://127.0.0.1:11434).
     let ollamaURL: String
-    /// Repo root, used to find voice/ for spawning `python -m notes`.
-    let repoRoot: URL
+    /// Repo root, used to find voice/ for spawning `python -m notes` (nil when
+    /// the bundle can't be traced back to a checkout — never guessed).
+    let repoRoot: URL?
     /// repoRoot/voice — cwd for the spawned notes backend.
-    let voiceDir: URL
+    let voiceDir: URL?
     /// Absolute path to `uv`, resolved for a GUI app's minimal PATH (nil if
     /// none of the well-known locations exist).
     let uvPath: String?
@@ -54,12 +60,16 @@ struct Config {
             ?? URL(string: "http://127.0.0.1:8787")!
         let healthURL = harnessURL.appendingPathComponent("health")
 
+        let bridgePort = value("SONAR_GLOW_PORT").flatMap { Int($0) } ?? 8770
+        let bridgeProbeURL = URL(string: "http://127.0.0.1:\(bridgePort)/")
+            ?? URL(string: "http://127.0.0.1:8770/")!
+
         let vaultPath = value("SONAR_VAULT_PATH")
             ?? (NSHomeDirectory() + "/Documents/Obsidian Vault")
         let ollamaURL = value("SONAR_OLLAMA_URL") ?? "http://127.0.0.1:11434"
 
         let repoRoot = Config.resolveRepoRoot(env: env)
-        let voiceDir = repoRoot.appendingPathComponent("voice", isDirectory: true)
+        let voiceDir = repoRoot?.appendingPathComponent("voice", isDirectory: true)
         let uvPath = Config.resolveUV(env: env)
 
         return Config(
@@ -70,6 +80,7 @@ struct Config {
             notesURL: notesURL,
             harnessURL: harnessURL,
             healthURL: healthURL,
+            bridgeProbeURL: bridgeProbeURL,
             vaultPath: vaultPath,
             ollamaURL: ollamaURL,
             repoRoot: repoRoot,
@@ -79,8 +90,13 @@ struct Config {
     }
 
     /// Find the repo root by preferring an explicit override, then walking up
-    /// from the bundle/executable looking for a `voice/notes` marker.
-    private static func resolveRepoRoot(env: [String: String]) -> URL {
+    /// from the bundle/executable looking for a `voice/notes` marker, then the
+    /// path build-app.sh stamps into Info.plist.
+    ///
+    /// Deliberately returns nil rather than falling back to the cwd: a
+    /// Finder-launched .app runs with cwd `/`, so that guess silently resolved
+    /// voiceDir to `/voice` for any bundle moved out of the checkout.
+    private static func resolveRepoRoot(env: [String: String]) -> URL? {
         let fm = FileManager.default
         func hasVoiceNotes(_ dir: URL) -> Bool {
             fm.fileExists(atPath: dir.appendingPathComponent("voice/notes").path)
@@ -110,8 +126,16 @@ struct Config {
             execDir = parent
         }
 
-        // Fall back to the current working directory.
-        return URL(fileURLWithPath: fm.currentDirectoryPath, isDirectory: true)
+        // Stamped at assembly time by build-app.sh, so a bundle dragged out of
+        // the checkout (the /Applications case) still finds voice/. Returned
+        // unvalidated: if the checkout later moved, the concrete "voice/ not
+        // found at <path>" that NotesBackend reports is the useful error.
+        if let stamped = Bundle.main.object(forInfoDictionaryKey: "SONARRepoRoot") as? String,
+           !stamped.isEmpty {
+            return URL(fileURLWithPath: stamped, isDirectory: true)
+        }
+
+        return nil
     }
 
     /// Resolve an absolute `uv` path. A GUI-launched .app inherits a minimal

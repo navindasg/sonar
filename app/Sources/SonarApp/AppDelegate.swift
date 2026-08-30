@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var notesWindow: NotesWindowController?
     private var watcher: NotesURLWatcher?
     private var health: HealthPoller?
+    private var services: ServiceProbe?
     private var backend: NotesBackend?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -20,6 +21,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let backend = NotesBackend(config: config)
         self.backend = backend
 
+        // Closing the Notes window hands :8771 back: a standalone backend that
+        // squats it for the app's lifetime is what makes a later spoken "take
+        // notes" fail to bind. Nothing happens when the page is served by a live
+        // voice loop we merely reused. Drop the page too — it retries its socket
+        // every 1.2s, and a hidden window must not hammer a port we just closed.
+        notesWindow.onHide = { [weak self] in
+            guard self?.backend?.releaseSpawned() == true else { return }
+            self?.notesWindow?.unload()
+        }
+
         let statusItem = StatusItemController()
         statusItem.onOpenNotes = { [weak self] in self?.openNotes() }
         self.statusItem = statusItem
@@ -28,8 +39,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         health.onUpdate = { [weak self] snapshot in
             self?.statusItem?.setHealth(snapshot)
         }
-        health.start()
         self.health = health
+
+        // Bridge (:8770) + Notes (:8771) liveness for the popover's stack-status
+        // rows; the harness row comes from the health poll above.
+        let services = ServiceProbe(bridgeURL: config.bridgeProbeURL, notesURL: config.notesURL)
+        services.onUpdate = { [weak self] status in
+            self?.statusItem?.setServices(status)
+        }
+        self.services = services
+
+        // Poll ONLY while the popover is on screen — its WebView is the sole
+        // consumer, so an always-on 5s timer would spend the app's whole
+        // lifetime hitting three localhost ports nobody is looking at (and each
+        // :8770 GET is a rejected handshake in the voice log). start() re-polls
+        // immediately and the status item keeps the last reading, so the popover
+        // paints known state at once and refreshes within one round trip.
+        statusItem.onPopoverVisibilityChanged = { [weak self] visible in
+            guard let self = self else { return }
+            if visible {
+                self.health?.start()
+                self.services?.start()
+            } else {
+                self.health?.stop()
+                self.services?.stop()
+            }
+        }
 
         // notes.url appearing/updating means the page is already serveable —
         // raise the window at whatever URL it names.
@@ -45,14 +80,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// loop, else spawn the standalone one), then raise the window.
     private func openNotes() {
         let url = config.notesURL
-        backend?.ensureRunning { [weak self] in
-            self?.notesWindow?.show(url: url)
+        backend?.ensureRunning { [weak self] outcome in
+            switch outcome {
+            case .ready:
+                self?.notesWindow?.show(url: url)
+            case .pending:
+                // Slow start, not a failure — NotesURLWatcher raises the window
+                // when notes.url lands. Raising it now would show a dead page.
+                NSLog("[Sonar] notes backend still starting; waiting for notes.url")
+            case .failed(let error):
+                self?.presentNotesFailure(error)
+            }
         }
+    }
+
+    /// The app's one error surface: say why Notes couldn't start instead of
+    /// leaving an NSLog line nobody reads (and a blank window nobody can fix).
+    private func presentNotesFailure(_ error: NotesBackendError) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Couldn't open Sonar Notes"
+        alert.informativeText = error.message
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         watcher?.stop()
         health?.stop()
+        services?.stop()
         backend?.terminate()
     }
 }

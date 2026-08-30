@@ -8,13 +8,21 @@ to the raw model text instead of losing the session.
 
 Pure pieces (prompt build, parse, render) unit-test without IO; ``summarize``
 does the single HTTP call via an injected httpx client.
+
+The tail of this module reads the rendered overview back OUT of markdown
+(``parse_action_items`` / ``user_action_items``), which is what lets store.py
+turn the user's own commitments into real to-do checkboxes. It parses the
+markdown rather than the overview dict on purpose: the dict is thrown away
+after rendering, and the user can hand-edit the overview in the review UI —
+so the markdown, not the model's JSON, is the source of truth by save time.
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
-from typing import Any
+from typing import Any, Iterable, Sequence
 
 from notes.session import SessionState, display_name
 
@@ -135,7 +143,15 @@ def render_overview(overview: dict[str, Any]) -> str:
             grouped.setdefault(person, []).append(task)
     if grouped:
         for person, tasks in grouped.items():
-            parts += [f"- **{person}**"] + [f"  - [ ] {t}" for t in tasks]
+            # PLAIN bullets, deliberately not "- [ ]". The harness's todo_list
+            # scans the whole vault for open checkboxes at any indent, so a
+            # checkbox here would enrol every ATTENDEE's commitment in the
+            # user's to-do list, and would list the user's own item twice (once
+            # here, once dated in store.py's "## My Action Items"). Exactly one
+            # section of a note is machine-scannable, and it is that one.
+            # Ticking an item off in the review UI still works: type "[x]" and
+            # parse_action_items drops it (the checkbox is optional there).
+            parts += [f"- **{person}**"] + [f"  - {t}" for t in tasks]
     else:
         parts.append("- (none)")
 
@@ -173,3 +189,104 @@ async def summarize(
         log.warning("overview reply was not valid JSON; using raw text")
         return raw.strip() or "_(AI overview unavailable)_"
     return render_overview(overview)
+
+
+# --- reading the overview back: whose action items are whose ------------------
+
+# Sonar has no way to tell WHICH voice in the room is its user — diarization
+# produces anonymous "S1"/"S2" clusters and the display names are free text the
+# user types per session. Guessing (e.g. "the first speaker is you") would file
+# other people's commitments as the user's to-dos, so identity is explicit
+# config: SONAR_USER_NAME, optionally a comma-separated list of the labels the
+# user gives themselves across sessions ("Navin, Navin Dasgupta, Me").
+USER_NAME_ENV = "SONAR_USER_NAME"
+
+_WS = re.compile(r"\s+")
+# Any markdown heading — used both to find the Action Items block and to know
+# where it ends (the next heading of any level).
+_HEADING = re.compile(r"^ {0,3}#{1,6}\s")
+_ACTION_HEADING = re.compile(r"^ {0,3}#{1,6}\s+Action Items\s*$", re.IGNORECASE)
+# A person row: the whole line is just a bold name ("- **Navin**"). Anchored so
+# prose that merely contains bold text can never be read as an owner.
+_PERSON_LINE = re.compile(r"^(?P<indent>\s*)[-*+]\s+\*\*(?P<person>.+?)\*\*\s*:?\s*$")
+# A task row NESTED under that person. The checkbox is optional (hand-edited
+# overviews often lose it); a ticked one is captured so it can be dropped.
+_TASK_LINE = re.compile(
+    r"^(?P<indent>\s*)[-*+]\s+(?:\[(?P<mark>.)\]\s+)?(?P<task>\S.*?)\s*$"
+)
+
+
+def _squeeze(text: str) -> str:
+    """One line, single-spaced — task text becomes a markdown checkbox, so a
+    stray newline in model output must not spawn a second bullet or a heading."""
+    return _WS.sub(" ", text).strip()
+
+
+def parse_action_items(summary_md: str) -> tuple[tuple[str, str], ...]:
+    """The (person, task) pairs in an overview's Action Items section.
+
+    Reads back what ``render_overview`` wrote, and tolerates the shapes a user
+    is likely to hand-type in the review UI (``*``/``+`` bullets, deeper indents,
+    a missing checkbox). Items already ticked (``[x]``) are skipped — a
+    commitment the user marked done must never be resurrected as an open
+    checkbox. A task must be nested UNDER a person to count: a bullet at the
+    person's own level is unowned, and unowned work is nobody's to-do.
+    """
+    items: list[tuple[str, str]] = []
+    person: str | None = None
+    person_indent = 0
+    in_section = False
+    for line in (summary_md or "").splitlines():
+        if _HEADING.match(line):
+            in_section = bool(_ACTION_HEADING.match(line))
+            person = None
+            continue
+        if not in_section:
+            continue
+        owner = _PERSON_LINE.match(line)
+        if owner:
+            person = _squeeze(owner.group("person"))
+            person_indent = len(owner.group("indent"))
+            continue
+        task = _TASK_LINE.match(line)
+        if person is None or task is None or len(task.group("indent")) <= person_indent:
+            continue
+        if (task.group("mark") or " ") != " ":
+            continue  # already ticked off
+        text = _squeeze(task.group("task"))
+        if text:
+            items.append((person, text))
+    return tuple(items)
+
+
+def configured_user_names(env: dict[str, str] | None = None) -> tuple[str, ...]:
+    """The labels the user answers to, from ``SONAR_USER_NAME`` (may be empty)."""
+    raw = (env if env is not None else os.environ).get(USER_NAME_ENV, "")
+    return tuple(name for name in (part.strip() for part in raw.split(",")) if name)
+
+
+def user_action_items(summary_md: str, user_names: Sequence[str]) -> tuple[str, ...]:
+    """The user's OWN open action items, in order, without repeats.
+
+    Empty when no name is configured — see USER_NAME_ENV for why we never guess.
+    Matching is exact on a case- and whitespace-insensitive comparison: looser
+    matching (prefixes, first names) would silently claim a colleague's items.
+    """
+    wanted = _folded(user_names)
+    if not wanted:
+        return ()
+    seen: set[str] = set()
+    mine: list[str] = []
+    for person, task in parse_action_items(summary_md):
+        if _squeeze(person).casefold() not in wanted:
+            continue
+        key = task.casefold()
+        if key not in seen:
+            seen.add(key)
+            mine.append(task)
+    return tuple(mine)
+
+
+def _folded(names: Iterable[str]) -> frozenset[str]:
+    """Comparable form of a name list, blanks dropped."""
+    return frozenset(f for f in (_squeeze(n).casefold() for n in names) if f)

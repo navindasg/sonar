@@ -47,3 +47,28 @@ CREATE TABLE IF NOT EXISTS todos (
 );
 
 CREATE INDEX IF NOT EXISTS idx_todos_status ON todos (status, created_at);
+
+-- Every step-event the harness emits (CONTRACTS.md §3), one row per event: the
+-- durable half of sonar_harness/events.py's in-memory ring. This is the "what
+-- did Sonar do, and why" audit trail the overlay polls and the Console surface
+-- reads back, so unlike the ring it has to survive a harness restart. It is
+-- append-only; rows leave only via the retention sweep (event_store.prune,
+-- SONAR_EVENTS_RETAIN_DAYS, default 30 days).
+CREATE TABLE IF NOT EXISTS events (
+    id       INTEGER PRIMARY KEY,
+    turn_id  TEXT NOT NULL,   -- correlates every step of one turn
+    ts       INTEGER NOT NULL,-- epoch MILLIseconds, not ISO like the tables above:
+                              -- it is the wire format the overlay already polls on
+    step     TEXT,            -- turn_start|tool|tool_result_summary|model_switch|final;
+                              -- nullable because an unrecognized step is kept, not dropped
+    tool     TEXT,            -- set on tool / tool_result_summary steps, else NULL
+    detail   TEXT,            -- short human string (<=120 chars), else NULL
+    status   TEXT             -- 'ok' | 'error' | 'pending'
+);
+
+-- The two read paths: the retention sweep and a 'since' scan walk ts; the
+-- overlay's live poll walks turn_id. id trails both so that events sharing one
+-- millisecond still come back in the order they were emitted.
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts, id);
+
+CREATE INDEX IF NOT EXISTS idx_events_turn ON events (turn_id, ts, id);
