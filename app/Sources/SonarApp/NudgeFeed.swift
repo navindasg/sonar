@@ -70,7 +70,11 @@ enum NudgeFeed {
     /// A single vault entry is unbounded on the wire. Cap it before it crosses
     /// the JS-source seam — the 2-line CSS clamp would hide it, but a
     /// pathological note should not become a megabyte of JavaScript literal.
-    static let maxLineChars = 400
+    ///
+    /// Counted in UNICODE SCALARS, not Characters: a grapheme cluster has no
+    /// length bound, so `prefix` on Swift's default Character view would let one
+    /// "character" carrying 200k combining marks through untouched.
+    static let maxLineScalars = 400
 
     private struct WirePayload: Decodable {
         let age_s: Double
@@ -100,7 +104,7 @@ enum NudgeFeed {
             NudgeItem(id: wire.id,
                       source: wire.source,
                       severity: wire.severity,
-                      line: String(wire.line.prefix(maxLineChars)))
+                      line: String(String.UnicodeScalarView(wire.line.unicodeScalars.prefix(maxLineScalars))))
         }
         return .ok(.init(
             items: Array(items),

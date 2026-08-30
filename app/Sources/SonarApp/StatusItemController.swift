@@ -336,12 +336,15 @@ final class StatusItemController: NSObject, NSPopoverDelegate, WKScriptMessageHa
     }
 
     private func resizePopover(to height: CGFloat) {
-        // Worst case with both feed sections full: ~385px of existing chrome +
-        // ~203px (3 nudge rows, 2-line clamp, plus the "N more not shown" note)
-        // + ~120px (3 activity rows) = ~708px. Both lists are hard-capped in JS,
-        // so this is a real bound rather than an estimate — but it is COUPLED to
-        // NUDGE_MAX/EV_MAX in PopoverHTML: raising a cap without recomputing
-        // this silently clips the footer.
+        // Both feed lists are hard-capped at 3 rows in JS, so the page height is
+        // bounded rather than open-ended. MEASURED against the live harness with
+        // 3 nudges (one wrapping to 2 lines) + 3 activity rows: 723px. The
+        // computed worst case, with every nudge wrapping and the doctor line at
+        // its longest, is ~742px — the clamp keeps ~18px over that.
+        //
+        // COUPLED to NUDGE_MAX/EV_MAX in PopoverHTML and to the unclamped
+        // .doctor .txt: content past this is clipped with no scrollbar, so
+        // re-measure if any of the three changes.
         let clamped = min(max(height, 200), 760)
         guard abs(clamped - popoverHeight) > 0.5 else { return }
         popoverHeight = clamped

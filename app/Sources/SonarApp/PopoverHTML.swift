@@ -271,16 +271,33 @@ svg{ fill:none; stroke:currentColor; stroke-width:1.25; stroke-linecap:round; st
     return s;
   }
 
-  // Age vocabulary. Event ages floor (a log row reading 22d for 22.5d is the
-  // ordinary convention); the nudge ceiling is computed in Swift and already
-  // rounded UP, so it can never under-report. -1 means "no honest value" and
-  // prints as an em dash, never as "now".
+  // Age vocabulary. Two formatters, because the two values round in OPPOSITE
+  // directions and sharing one silently breaks the nudge invariant.
+  //
+  // -1 means "no honest value" in both, and prints as an em dash, never "now".
+
+  // Event ages FLOOR — the ordinary log convention, where a row reading 22d for
+  // something 22.5d old is what a reader expects.
   function fmtAge(n){
     if(n==null || n<0) return '—';
     if(n<60) return n+'s';
     if(n<3600) return Math.floor(n/60)+'m';
     if(n<86400) return Math.floor(n/3600)+'h';
     return Math.floor(n/86400)+'d';
+  }
+
+  // The nudge bound must CEIL, at every magnitude. Swift rounds the value up,
+  // but flooring it here would cancel that: ceil=66 through the floor formatter
+  // printed "≤1m old" for a snapshot 60.8s old — an upper bound stated LOWER
+  // than the true age, which is the one thing this number promises not to do.
+  // Seconds are kept below 120 so the common case stays precise rather than
+  // coarsening a 66s bound to "≤2m"; above that, unit conversion divides up.
+  function fmtAgeCeil(n){
+    if(n==null || n<0) return '—';
+    if(n<120) return n+'s';
+    if(n<3600) return Math.ceil(n/60)+'m';
+    if(n<86400) return Math.ceil(n/3600)+'h';
+    return Math.ceil(n/86400)+'d';
   }
 
   function renderNudges(n){
@@ -295,7 +312,7 @@ svg{ fill:none; stroke:currentColor; stroke-width:1.25; stroke-linecap:round; st
     if(!n){ list.appendChild(txt('div','empty faint','Checking…')); return; }
 
     if(n.state==='ok' && n.items && n.items.length){
-      aux.textContent = '≤'+fmtAge(n.ageCeilingS)+' old';
+      aux.textContent = '≤'+fmtAgeCeil(n.ageCeilingS)+' old';
       var k=Math.min(n.items.length, NUDGE_MAX);
       for(var i=0;i<k;i++){
         var it=n.items[i]||{};
@@ -324,7 +341,7 @@ svg{ fill:none; stroke:currentColor; stroke-width:1.25; stroke-linecap:round; st
     if(n.state==='ok' || n.state==='empty'){
       // The age ceiling still prints here: a FRESH nothing is what distinguishes
       // this from the unreachable/stale states, which show an em dash.
-      aux.textContent = '≤'+fmtAge(n.ageCeilingS)+' old';
+      aux.textContent = '≤'+fmtAgeCeil(n.ageCeilingS)+' old';
       // Describes the RESPONSE, not the world. The harness answers a wedged
       // engine with a byte-identical empty snapshot, so "nothing needs you"
       // would be a claim this surface cannot back.

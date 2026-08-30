@@ -210,7 +210,32 @@ check('hostile status stays neutral (allowlist)', JSON.stringify(rowCls) === JSO
 const ages = await page.evaluate(() => [...document.querySelectorAll('#evList .age')].map(e => e.textContent))
 check('ageS -1 renders as em dash, never "now"', ages[1] === '—', JSON.stringify(ages))
 
-// ---- 16. renderer isolation ------------------------------------------------
+// ---- 16. the nudge bound must never UNDER-report ---------------------------
+// Regression: the ceiling was originally printed through the FLOORING formatter,
+// so ceil=66 rendered "≤1m old" for a snapshot 60.8s old — an upper bound stated
+// lower than the true age, which is the one thing this number promises not to do.
+// The reachable range is 0..ttl+2*grace (=70 with the live 60s TTL), but the
+// invariant is asserted across every unit boundary so a TTL change cannot
+// silently reintroduce it.
+{
+  const UNIT = { s: 1, m: 60, h: 3600, d: 86400 }
+  const cases = [1, 5, 59, 60, 61, 66, 70, 119, 120, 121, 3599, 3600, 3661, 5400, 86399, 86400, 90000, 172799]
+  const violations = []
+  for (const ceiling of cases) {
+    await apply({ ...HEALTH, nudges: nudge('ok', { items: [N3[0]], returned: 1, ageCeilingS: ceiling }), activity: act('empty') })
+    const aux = (await snap()).nudgeAux            // "≤66s old"
+    const shown = aux.replace(/^≤/, '').replace(/ old$/, '')
+    const implied = parseInt(shown, 10) * UNIT[shown.slice(-1)]
+    if (!(implied >= ceiling)) violations.push(`ceiling=${ceiling}s displayed '${aux}' implies ≤${implied}s`)
+  }
+  check('nudge age bound never under-reports at any unit boundary', violations.length === 0, violations.join('; '))
+}
+
+// Event ages, by contrast, SHOULD floor — the ordinary log convention.
+await apply({ ...HEALTH, nudges: nudge('empty', { ageCeilingS: 1 }), activity: act('ok', { items: [{ ...EV3[0], ageS: 1944000 }], newestAgeS: 1944000 }) })
+check('event ages still floor (22.5d reads as 22d)', (await snap()).evAux === 'newest 22d', (await snap()).evAux)
+
+// ---- 17. renderer isolation ------------------------------------------------
 await apply({ ...HEALTH, nudges: null, activity: act('ok', { items: EV3, newestAgeS: 30 }) })
 s = await snap()
 check('null nudges section degrades to Checking, activity still renders', s.nudgeText === 'Checking…' && s.evRows === 3, `${s.nudgeText}|${s.evRows}`)
